@@ -4,6 +4,38 @@ const std = @import("std");
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
 
+const Vertex = struct {
+    const binding_description = vk.VertexInputBindingDescription{
+        .binding = 0,
+        .stride = @sizeOf(Vertex),
+        .input_rate = .vertex,
+    };
+
+    const attribute_description = [_]vk.VertexInputAttributeDescription{
+        .{
+            .binding = 0,
+            .location = 0,
+            .format = .r32g32_sfloat,
+            .offset = @offsetOf(Vertex, "pos"),
+        },
+        .{
+            .binding = 0,
+            .location = 1,
+            .format = .r32g32b32_sfloat,
+            .offset = @offsetOf(Vertex, "color"),
+        },
+    };
+
+    pos: [2]f32,
+    color: [3]f32,
+};
+
+const vertices = [_]Vertex{
+    .{ .pos = .{ 0, -0.5 }, .color = .{ 1, 0, 0 } },
+    .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
+    .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
+};
+
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.frag.spv").*;
 
@@ -60,9 +92,24 @@ pub fn main() !void {
     }, cmdbufs.ptr);
     defer gc.dev.freeCommandBuffers(command_pool, @intCast(cmdbufs.len), cmdbufs.ptr);
 
+    const buffer = try gc.dev.createBuffer(&.{
+        .size = @sizeOf(@TypeOf(vertices)),
+        .usage = .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
+        .sharing_mode = .exclusive,
+    }, null);
+    defer gc.dev.destroyBuffer(buffer, null);
+    const mem_reqs = gc.dev.getBufferMemoryRequirements(buffer);
+    const memory = try gc.allocate(mem_reqs, .{ .device_local_bit = true });
+    defer gc.dev.freeMemory(memory, null);
+    try gc.dev.bindBufferMemory(buffer, memory, 0);
+
+    try uploadVertices(&gc, command_pool, buffer);
+
     const pipeline_layout = try gc.dev.createPipelineLayout(&vk.PipelineLayoutCreateInfo{}, null);
+    defer gc.dev.destroyPipelineLayout(pipeline_layout, null);
 
     const pipeline = try createPipeline(&gc, pipeline_layout, swapchain.surface_format.format);
+    defer gc.dev.destroyPipeline(pipeline, null);
 
     var state: Swapchain.PresentState = .optimal;
     var should_quit: bool = false;
@@ -149,6 +196,8 @@ pub fn main() !void {
         });
 
         gc.dev.cmdBindPipeline(cmdbuf, .graphics, pipeline);
+        const offset = [_]vk.DeviceSize{0};
+        gc.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&buffer), &offset);
         gc.dev.cmdDraw(cmdbuf, 3, 1, 0, 0);
         gc.dev.cmdEndRendering(cmdbuf);
 
@@ -224,7 +273,12 @@ fn createPipeline(
         },
     };
 
-    const pvisci = vk.PipelineVertexInputStateCreateInfo{};
+    const pvisci = vk.PipelineVertexInputStateCreateInfo{
+        .vertex_binding_description_count = 1,
+        .p_vertex_binding_descriptions = @ptrCast(&Vertex.binding_description),
+        .vertex_attribute_description_count = Vertex.attribute_description.len,
+        .p_vertex_attribute_descriptions = &Vertex.attribute_description,
+    };
 
     const piasci = vk.PipelineInputAssemblyStateCreateInfo{
         .topology = .triangle_list,
@@ -322,4 +376,60 @@ fn createPipeline(
         @ptrCast(&pipeline),
     );
     return pipeline;
+}
+
+fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
+    const staging_buffer = try gc.dev.createBuffer(&.{
+        .size = @sizeOf(@TypeOf(vertices)),
+        .usage = .{ .transfer_src_bit = true },
+        .sharing_mode = .exclusive,
+    }, null);
+    defer gc.dev.destroyBuffer(staging_buffer, null);
+    const mem_reqs = gc.dev.getBufferMemoryRequirements(staging_buffer);
+    const staging_memory = try gc.allocate(mem_reqs, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    defer gc.dev.freeMemory(staging_memory, null);
+    try gc.dev.bindBufferMemory(staging_buffer, staging_memory, 0);
+
+    {
+        const data = try gc.dev.mapMemory(staging_memory, 0, vk.WHOLE_SIZE, .{});
+        defer gc.dev.unmapMemory(staging_memory);
+
+        const gpu_vertices: [*]Vertex = @ptrCast(@alignCast(data));
+        @memcpy(gpu_vertices, vertices[0..]);
+    }
+
+    try copyBuffer(gc, pool, buffer, staging_buffer, @sizeOf(@TypeOf(vertices)));
+}
+
+fn copyBuffer(gc: *const GraphicsContext, pool: vk.CommandPool, dst: vk.Buffer, src: vk.Buffer, size: vk.DeviceSize) !void {
+    var cmdbuf_handle: vk.CommandBuffer = undefined;
+    try gc.dev.allocateCommandBuffers(&.{
+        .command_pool = pool,
+        .level = .primary,
+        .command_buffer_count = 1,
+    }, @ptrCast(&cmdbuf_handle));
+    defer gc.dev.freeCommandBuffers(pool, 1, @ptrCast(&cmdbuf_handle));
+
+    const cmdbuf = GraphicsContext.CommandBuffer.init(cmdbuf_handle, gc.dev.wrapper);
+
+    try cmdbuf.beginCommandBuffer(&.{
+        .flags = .{ .one_time_submit_bit = true },
+    });
+
+    const region = vk.BufferCopy{
+        .src_offset = 0,
+        .dst_offset = 0,
+        .size = size,
+    };
+    cmdbuf.copyBuffer(src, dst, 1, @ptrCast(&region));
+
+    try cmdbuf.endCommandBuffer();
+
+    const si = vk.SubmitInfo{
+        .command_buffer_count = 1,
+        .p_command_buffers = (&cmdbuf.handle)[0..1],
+        .p_wait_dst_stage_mask = undefined,
+    };
+    try gc.dev.queueSubmit(gc.graphics_queue.handle, 1, @ptrCast(&si), .null_handle);
+    try gc.dev.queueWaitIdle(gc.graphics_queue.handle);
 }
