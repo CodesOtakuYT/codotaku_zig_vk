@@ -7,72 +7,8 @@ const Buffer = @import("buffer.zig");
 const za = @import("zalgebra");
 const Vec3 = za.Vec3;
 const Mat4 = za.Mat4;
-
-const Vertex = struct {
-    const binding_description = vk.VertexInputBindingDescription{
-        .binding = 0,
-        .stride = @sizeOf(Vertex),
-        .input_rate = .vertex,
-    };
-
-    const attribute_description = [_]vk.VertexInputAttributeDescription{
-        .{
-            .binding = 0,
-            .location = 0,
-            .format = .r32g32b32_sfloat,
-            .offset = @offsetOf(Vertex, "pos"),
-        },
-        .{
-            .binding = 0,
-            .location = 1,
-            .format = .r32g32b32_sfloat,
-            .offset = @offsetOf(Vertex, "color"),
-        },
-    };
-
-    pos: Vec3,
-    color: Vec3,
-};
-
-const vertices = [_]Vertex{
-    // Front face
-    .{ .pos = Vec3.new(-0.5, -0.5, 0.5), .color = Vec3.new(1, 0, 0) },
-    .{ .pos = Vec3.new(0.5, -0.5, 0.5), .color = Vec3.new(0, 1, 0) },
-    .{ .pos = Vec3.new(0.5, 0.5, 0.5), .color = Vec3.new(0, 0, 1) },
-    .{ .pos = Vec3.new(-0.5, 0.5, 0.5), .color = Vec3.new(1, 1, 0) },
-
-    // Back face
-    .{ .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(1, 0, 1) },
-    .{ .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(0, 1, 1) },
-    .{ .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(1, 1, 1) },
-    .{ .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(0, 0, 0) },
-};
-
-const indices = [_]u32{
-    // Front
-    0, 1, 2,
-    2, 3, 0,
-
-    // Back
-    4, 6, 5,
-    6, 4, 7,
-
-    // Left
-    4, 0, 3,
-    3, 7, 4,
-
-    // Right
-    1, 5, 6,
-    6, 2, 1,
-
-    // Top
-    3, 2, 6,
-    6, 7, 3,
-
-    // Bottom
-    4, 5, 1,
-    1, 0, 4,
-};
+const Mesh = @import("mesh.zig").Mesh;
+const Vertex = @import("mesh.zig").Vertex;
 
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.frag.spv").*;
@@ -104,20 +40,22 @@ gc: GraphicsContext,
 swapchain: Swapchain,
 command_pool: vk.CommandPool,
 cmdbufs: []vk.CommandBuffer,
-vertex_buffer: Buffer,
-index_buffer: Buffer,
+mesh: Mesh,
 uniform_buffer: Buffer,
 descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
 pipeline: vk.Pipeline,
 state: Swapchain.PresentState = .optimal,
 should_quit: bool = false,
+start_ticks: u64,
 
 fn alignForward(value: usize, alignment: usize) usize {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
 pub fn init(allocator: std.mem.Allocator) !App {
+    const start_ticks = c.SDL_GetTicks();
+
     try checkSDL(c.SDL_Init(c.SDL_INIT_VIDEO));
     errdefer c.SDL_Quit();
 
@@ -151,56 +89,19 @@ pub fn init(allocator: std.mem.Allocator) !App {
     }, cmdbufs.ptr);
     errdefer gc.dev.freeCommandBuffers(command_pool, @intCast(cmdbufs.len), cmdbufs.ptr);
 
-    const vertex_size = @sizeOf(@TypeOf(vertices));
-    const index_size = @sizeOf(@TypeOf(indices));
-    const uniform_size = @sizeOf(Mat4);
+    const mesh = try Mesh.initCube(&gc, command_pool);
 
-    const vertex_offset = 0;
-    const index_offset = alignForward(vertex_size, 4); // or better: use device limits
-    const uniform_offset = alignForward(index_offset + index_size, 4);
-
-    const total_size = uniform_offset + uniform_size;
-
-    var staging = try Buffer.init(
-        &gc,
-        total_size,
-        .{ .transfer_src_bit = true },
-        .{ .host_visible_bit = true, .host_coherent_bit = true },
-    );
-    defer staging.deinit(&gc);
-
-    try staging.mapWrite(&gc, Vertex, vertices[0..], vertex_offset);
-    try staging.mapWrite(&gc, u32, indices[0..], index_offset);
-    const mvp = makeMVP();
-    try staging.mapWrite(&gc, Mat4, &.{mvp}, uniform_offset);
-
-    var vertex_buffer = try Buffer.init(
-        &gc,
-        vertex_size,
-        .{ .transfer_dst_bit = true, .vertex_buffer_bit = true },
-        .{ .device_local_bit = true },
-    );
-    errdefer vertex_buffer.deinit(&gc);
-
-    var index_buffer = try Buffer.init(
-        &gc,
-        index_size,
-        .{ .transfer_dst_bit = true, .index_buffer_bit = true },
-        .{ .device_local_bit = true },
-    );
-    errdefer index_buffer.deinit(&gc);
+    const mvp = makeMVP(0.0);
 
     var uniform_buffer = try Buffer.init(
         &gc,
-        uniform_size,
-        .{ .transfer_dst_bit = true, .uniform_buffer_bit = true },
-        .{ .device_local_bit = true },
+        @sizeOf(Mat4),
+        .{ .uniform_buffer_bit = true },
+        .{ .host_visible_bit = true, .host_coherent_bit = true },
     );
     errdefer uniform_buffer.deinit(&gc);
 
-    try staging.copyTo(&gc, command_pool, vertex_buffer, vertex_offset);
-    try staging.copyTo(&gc, command_pool, index_buffer, index_offset);
-    try staging.copyTo(&gc, command_pool, uniform_buffer, uniform_offset);
+    try uniform_buffer.mapWrite(&gc, Mat4, &.{mvp}, 0);
 
     const descriptor_set_layout = try gc.dev.createDescriptorSetLayout(&vk.DescriptorSetLayoutCreateInfo{
         .flags = vk.DescriptorSetLayoutCreateFlags{ .push_descriptor_bit = true },
@@ -231,22 +132,23 @@ pub fn init(allocator: std.mem.Allocator) !App {
         .swapchain = swapchain,
         .command_pool = command_pool,
         .cmdbufs = cmdbufs,
-        .vertex_buffer = vertex_buffer,
-        .index_buffer = index_buffer,
         .pipeline_layout = pipeline_layout,
         .pipeline = pipeline,
         .uniform_buffer = uniform_buffer,
         .descriptor_set_layout = descriptor_set_layout,
+        .mesh = mesh,
+        .start_ticks = start_ticks,
     };
 }
 
 pub fn deinit(self: *App) void {
     self.gc.dev.deviceWaitIdle() catch {};
 
+    self.gc.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
     self.gc.dev.destroyPipeline(self.pipeline, null);
     self.gc.dev.destroyPipelineLayout(self.pipeline_layout, null);
-    self.vertex_buffer.deinit(&self.gc);
-    self.index_buffer.deinit(&self.gc);
+    self.uniform_buffer.deinit(&self.gc);
+    self.mesh.deinit(&self.gc);
     self.gc.dev.freeCommandBuffers(self.command_pool, @intCast(self.cmdbufs.len), self.cmdbufs.ptr);
     self.gc.dev.destroyCommandPool(self.command_pool, null);
     self.allocator.free(self.cmdbufs);
@@ -259,6 +161,9 @@ pub fn deinit(self: *App) void {
 
 pub fn run(self: *App) !void {
     while (!self.should_quit) {
+        const now = c.SDL_GetTicks();
+        const time = @as(f32, @floatFromInt(now - self.start_ticks)) / 1000.0;
+
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -289,118 +194,13 @@ pub fn run(self: *App) !void {
         try current.waitForFence(&self.gc);
         try self.gc.dev.resetFences(1, @ptrCast(&current.frame_fence));
 
+        const mvp = makeMVP(time);
+        try self.uniform_buffer.mapWrite(&self.gc, Mat4, &.{mvp}, 0);
+
         const cmdbuf = self.cmdbufs[self.swapchain.image_index];
         try self.gc.dev.resetCommandBuffer(cmdbuf, .{});
 
-        try self.gc.dev.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
-            .flags = .{ .one_time_submit_bit = true },
-        });
-
-        self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
-            .image_memory_barrier_count = 1,
-            .p_image_memory_barriers = @ptrCast(&vk.ImageMemoryBarrier2{
-                .image = self.swapchain.currentImage(),
-                .old_layout = .undefined,
-                .new_layout = .color_attachment_optimal,
-                .src_access_mask = .{},
-                .dst_access_mask = .{ .color_attachment_write_bit = true },
-                .src_stage_mask = .{ .top_of_pipe_bit = true },
-                .dst_stage_mask = .{ .color_attachment_output_bit = true },
-                .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
-                    .layer_count = 1,
-                    .level_count = 1,
-                    .base_array_layer = 0,
-                    .base_mip_level = 0,
-                },
-                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-            }),
-        });
-
-        self.gc.dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&vk.Viewport{ .x = 0, .y = 0, .width = @floatFromInt(extent.width), .height = @floatFromInt(extent.height), .min_depth = 0, .max_depth = 1 }));
-        self.gc.dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.swapchain.extent }));
-
-        self.gc.dev.cmdBeginRendering(cmdbuf, &vk.RenderingInfo{
-            .layer_count = 1,
-            .color_attachment_count = 1,
-            .render_area = .{
-                .extent = extent,
-                .offset = .{ .x = 0, .y = 0 },
-            },
-            .p_color_attachments = @ptrCast(&vk.RenderingAttachmentInfo{
-                .clear_value = .{
-                    .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } },
-                },
-                .image_view = current.view,
-                .image_layout = .color_attachment_optimal,
-                .load_op = .clear,
-                .store_op = .store,
-                .resolve_mode = .{},
-                .resolve_image_layout = .undefined,
-            }),
-            .view_mask = 0,
-        });
-
-        self.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.pipeline);
-        const offsets = [_]vk.DeviceSize{0};
-        self.gc.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&self.vertex_buffer.buffer), &offsets);
-        self.gc.dev.cmdBindIndexBuffer(cmdbuf, self.index_buffer.buffer, 0, .uint32);
-        // self.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.pipeline_layout, 0, 1, @ptrCast(&vk.WriteDescriptorSet{}));
-        const buffer_info = vk.DescriptorBufferInfo{
-            .buffer = self.uniform_buffer.buffer,
-            .offset = 0,
-            .range = @sizeOf(Mat4),
-        };
-
-        const dummy_image_info: vk.DescriptorImageInfo = undefined;
-        const dummy_texel_view: vk.BufferView = undefined;
-
-        const write = vk.WriteDescriptorSet{
-            .dst_binding = 0,
-            .descriptor_count = 1,
-            .descriptor_type = .uniform_buffer,
-            .p_buffer_info = @ptrCast(&buffer_info),
-            .dst_array_element = 0,
-            .dst_set = .null_handle,
-            .p_image_info = @ptrCast(&dummy_image_info),
-            .p_texel_buffer_view = @ptrCast(&dummy_texel_view),
-        };
-
-        self.gc.dev.cmdPushDescriptorSet(
-            cmdbuf,
-            .graphics,
-            self.pipeline_layout,
-            0, // set index
-            1,
-            @ptrCast(&write),
-        );
-        self.gc.dev.cmdDrawIndexed(cmdbuf, indices.len, 1, 0, 0, 0);
-        self.gc.dev.cmdEndRendering(cmdbuf);
-
-        self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
-            .image_memory_barrier_count = 1,
-            .p_image_memory_barriers = @ptrCast(&vk.ImageMemoryBarrier2{
-                .image = self.swapchain.currentImage(),
-                .old_layout = .color_attachment_optimal,
-                .new_layout = .present_src_khr,
-                .src_access_mask = .{ .color_attachment_write_bit = true },
-                .dst_access_mask = .{},
-                .src_stage_mask = .{ .color_attachment_output_bit = true },
-                .dst_stage_mask = .{ .bottom_of_pipe_bit = true },
-                .subresource_range = .{
-                    .aspect_mask = .{ .color_bit = true },
-                    .layer_count = 1,
-                    .level_count = 1,
-                    .base_array_layer = 0,
-                    .base_mip_level = 0,
-                },
-                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-            }),
-        });
-
-        try self.gc.dev.endCommandBuffer(cmdbuf);
+        try self.recordCommandBuffer(cmdbuf);
 
         self.state = self.swapchain.present(cmdbuf) catch |err| switch (err) {
             error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
@@ -409,6 +209,118 @@ pub fn run(self: *App) !void {
     }
 
     try self.gc.dev.deviceWaitIdle();
+}
+
+fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
+    const extent = self.swapchain.extent;
+    const current = self.swapchain.currentSwapImage();
+
+    try self.gc.dev.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
+        .flags = .{ .one_time_submit_bit = true },
+    });
+
+    self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
+        .image_memory_barrier_count = 1,
+        .p_image_memory_barriers = @ptrCast(&vk.ImageMemoryBarrier2{
+            .image = self.swapchain.currentImage(),
+            .old_layout = .undefined,
+            .new_layout = .color_attachment_optimal,
+            .src_access_mask = .{},
+            .dst_access_mask = .{ .color_attachment_write_bit = true },
+            .src_stage_mask = .{ .top_of_pipe_bit = true },
+            .dst_stage_mask = .{ .color_attachment_output_bit = true },
+            .subresource_range = .{
+                .aspect_mask = .{ .color_bit = true },
+                .layer_count = 1,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .base_mip_level = 0,
+            },
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        }),
+    });
+
+    self.gc.dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&vk.Viewport{ .x = 0, .y = 0, .width = @floatFromInt(extent.width), .height = @floatFromInt(extent.height), .min_depth = 0, .max_depth = 1 }));
+    self.gc.dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.swapchain.extent }));
+
+    self.gc.dev.cmdBeginRendering(cmdbuf, &vk.RenderingInfo{
+        .layer_count = 1,
+        .color_attachment_count = 1,
+        .render_area = .{
+            .extent = extent,
+            .offset = .{ .x = 0, .y = 0 },
+        },
+        .p_color_attachments = @ptrCast(&vk.RenderingAttachmentInfo{
+            .clear_value = .{
+                .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } },
+            },
+            .image_view = current.view,
+            .image_layout = .color_attachment_optimal,
+            .load_op = .clear,
+            .store_op = .store,
+            .resolve_mode = .{},
+            .resolve_image_layout = .undefined,
+        }),
+        .view_mask = 0,
+    });
+
+    self.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.pipeline);
+
+    const buffer_info = vk.DescriptorBufferInfo{
+        .buffer = self.uniform_buffer.buffer,
+        .offset = 0,
+        .range = @sizeOf(Mat4),
+    };
+
+    const dummy_image_info: vk.DescriptorImageInfo = undefined;
+    const dummy_texel_view: vk.BufferView = undefined;
+
+    const write = vk.WriteDescriptorSet{
+        .dst_binding = 0,
+        .descriptor_count = 1,
+        .descriptor_type = .uniform_buffer,
+        .p_buffer_info = @ptrCast(&buffer_info),
+        .dst_array_element = 0,
+        .dst_set = .null_handle,
+        .p_image_info = @ptrCast(&dummy_image_info),
+        .p_texel_buffer_view = @ptrCast(&dummy_texel_view),
+    };
+
+    self.gc.dev.cmdPushDescriptorSet(
+        cmdbuf,
+        .graphics,
+        self.pipeline_layout,
+        0,
+        1,
+        @ptrCast(&write),
+    );
+    self.mesh.draw(&self.gc, cmdbuf);
+    self.gc.dev.cmdEndRendering(cmdbuf);
+
+    self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
+        .image_memory_barrier_count = 1,
+        .p_image_memory_barriers = @ptrCast(&vk.ImageMemoryBarrier2{
+            .image = self.swapchain.currentImage(),
+            .old_layout = .color_attachment_optimal,
+            .new_layout = .present_src_khr,
+            .src_access_mask = .{ .color_attachment_write_bit = true },
+            .dst_access_mask = .{},
+            .src_stage_mask = .{ .color_attachment_output_bit = true },
+            .dst_stage_mask = .{ .bottom_of_pipe_bit = true },
+            .subresource_range = .{
+                .aspect_mask = .{ .color_bit = true },
+                .layer_count = 1,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .base_mip_level = 0,
+            },
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        }),
+    });
+
+    try self.gc.dev.endCommandBuffer(cmdbuf);
 }
 
 fn createPipeline(
@@ -546,7 +458,7 @@ fn createPipeline(
     return pipeline;
 }
 
-pub fn makeMVP() Mat4 {
+pub fn makeMVP(time: f32) Mat4 {
     var projection = za.perspective(45.0, 800.0 / 600.0, 0.1, 100.0);
     projection.data[1][1] *= -1;
 
@@ -556,9 +468,11 @@ pub fn makeMVP() Mat4 {
         Vec3.up(),
     );
 
-    const model = Mat4.fromTranslate(
-        Vec3.new(0.2, 0.5, 0.0),
-    );
+    const angle = time * 50.0;
+    const model =
+        Mat4.fromRotation(angle, Vec3.up())
+            .mul(Mat4.fromRotation(angle * 0.7, Vec3.right()))
+            .mul(Mat4.fromTranslate(Vec3.new(0.2, 0.5, 0.0)));
 
     return Mat4.mul(projection, Mat4.mul(view, model));
 }
