@@ -1,0 +1,3 @@
+#! /bin/bash
+glslc shaders/triangle.vert -o src/shaders/triangle.vert.spv
+glslc shaders/triangle.frag -o src/shaders/triangle.frag.spv

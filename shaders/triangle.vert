@@ -5,7 +5,12 @@ layout(location = 1) in vec3 a_color;
 
 layout(location = 0) out vec3 v_color;
 
+// Camera uniform (MVP matrix)
+layout(set = 0, binding = 0) uniform Camera {
+    mat4 mvp;
+} camera;
+
 void main() {
-    gl_Position = vec4(a_pos, 1.0);
+    gl_Position = camera.mvp * vec4(a_pos, 1.0);
     v_color = a_color;
 }

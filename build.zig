@@ -173,4 +173,10 @@ pub fn build(b: *std.Build) void {
     });
     const sdl_lib = sdl_dep.artifact("SDL3");
     exe.linkLibrary(sdl_lib);
+
+    const zalgebra = b.dependency("zalgebra", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("zalgebra", zalgebra.module("zalgebra"));
 }

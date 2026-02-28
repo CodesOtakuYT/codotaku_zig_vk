@@ -40,6 +40,10 @@
             .url = "git+https://github.com/castholm/SDL.git#887fa805e40d5c7bb3955ae69b89ed566c6a0471",
             .hash = "sdl-0.4.0+3.4.0-SDL--rq2owEZsySGuHCuVJ9naEvH3i3e_pyUIjziBtJ-",
         },
+        .zalgebra = .{
+            .url = "git+https://github.com/kooparse/zalgebra#fe19b7816f03d86d56d4fa62f943664edf5d367f",
+            .hash = "zalgebra-0.0.0-aaiVSrp2AQBLjd3lvhR0ILaVDHeqOpwNFCp0ZJHj0xhk",
+        },
     },
     .paths = .{
         "build.zig",

@@ -4,6 +4,9 @@ const std = @import("std");
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
 const Buffer = @import("buffer.zig");
+const za = @import("zalgebra");
+const Vec3 = za.Vec3;
+const Mat4 = za.Mat4;
 
 const Vertex = struct {
     const binding_description = vk.VertexInputBindingDescription{
@@ -27,18 +30,48 @@ const Vertex = struct {
         },
     };
 
-    pos: [3]f32,
-    color: [3]f32,
+    pos: Vec3,
+    color: Vec3,
 };
 
 const vertices = [_]Vertex{
-    .{ .pos = .{ 0, -0.5, 0.0 }, .color = .{ 1, 0, 0 } },
-    .{ .pos = .{ 0.5, 0.5, 0.0 }, .color = .{ 0, 1, 0 } },
-    .{ .pos = .{ -0.5, 0.5, 0.0 }, .color = .{ 0, 0, 1 } },
+    // Front face
+    .{ .pos = Vec3.new(-0.5, -0.5, 0.5), .color = Vec3.new(1, 0, 0) },
+    .{ .pos = Vec3.new(0.5, -0.5, 0.5), .color = Vec3.new(0, 1, 0) },
+    .{ .pos = Vec3.new(0.5, 0.5, 0.5), .color = Vec3.new(0, 0, 1) },
+    .{ .pos = Vec3.new(-0.5, 0.5, 0.5), .color = Vec3.new(1, 1, 0) },
+
+    // Back face
+    .{ .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(1, 0, 1) },
+    .{ .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(0, 1, 1) },
+    .{ .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(1, 1, 1) },
+    .{ .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(0, 0, 0) },
 };
 
 const indices = [_]u32{
+    // Front
     0, 1, 2,
+    2, 3, 0,
+
+    // Back
+    4, 6, 5,
+    6, 4, 7,
+
+    // Left
+    4, 0, 3,
+    3, 7, 4,
+
+    // Right
+    1, 5, 6,
+    6, 2, 1,
+
+    // Top
+    3, 2, 6,
+    6, 7, 3,
+
+    // Bottom
+    4, 5, 1,
+    1, 0, 4,
 };
 
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
@@ -73,6 +106,8 @@ command_pool: vk.CommandPool,
 cmdbufs: []vk.CommandBuffer,
 vertex_buffer: Buffer,
 index_buffer: Buffer,
+uniform_buffer: Buffer,
+descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
 pipeline: vk.Pipeline,
 state: Swapchain.PresentState = .optimal,
@@ -118,11 +153,13 @@ pub fn init(allocator: std.mem.Allocator) !App {
 
     const vertex_size = @sizeOf(@TypeOf(vertices));
     const index_size = @sizeOf(@TypeOf(indices));
+    const uniform_size = @sizeOf(Mat4);
 
     const vertex_offset = 0;
     const index_offset = alignForward(vertex_size, 4); // or better: use device limits
+    const uniform_offset = alignForward(index_offset + index_size, 4);
 
-    const total_size = index_offset + index_size;
+    const total_size = uniform_offset + uniform_size;
 
     var staging = try Buffer.init(
         &gc,
@@ -134,6 +171,8 @@ pub fn init(allocator: std.mem.Allocator) !App {
 
     try staging.mapWrite(&gc, Vertex, vertices[0..], vertex_offset);
     try staging.mapWrite(&gc, u32, indices[0..], index_offset);
+    const mvp = makeMVP();
+    try staging.mapWrite(&gc, Mat4, &.{mvp}, uniform_offset);
 
     var vertex_buffer = try Buffer.init(
         &gc,
@@ -151,10 +190,35 @@ pub fn init(allocator: std.mem.Allocator) !App {
     );
     errdefer index_buffer.deinit(&gc);
 
-    try staging.copyTo(&gc, command_pool, vertex_buffer, 0);
-    try staging.copyTo(&gc, command_pool, index_buffer, vertex_size);
+    var uniform_buffer = try Buffer.init(
+        &gc,
+        uniform_size,
+        .{ .transfer_dst_bit = true, .uniform_buffer_bit = true },
+        .{ .device_local_bit = true },
+    );
+    errdefer uniform_buffer.deinit(&gc);
 
-    const pipeline_layout = try gc.dev.createPipelineLayout(&vk.PipelineLayoutCreateInfo{}, null);
+    try staging.copyTo(&gc, command_pool, vertex_buffer, vertex_offset);
+    try staging.copyTo(&gc, command_pool, index_buffer, index_offset);
+    try staging.copyTo(&gc, command_pool, uniform_buffer, uniform_offset);
+
+    const descriptor_set_layout = try gc.dev.createDescriptorSetLayout(&vk.DescriptorSetLayoutCreateInfo{
+        .flags = vk.DescriptorSetLayoutCreateFlags{ .push_descriptor_bit = true },
+        .binding_count = 1,
+        .p_bindings = &[_]vk.DescriptorSetLayoutBinding{
+            .{
+                .binding = 0,
+                .descriptor_type = .uniform_buffer,
+                .descriptor_count = 1,
+                .stage_flags = vk.ShaderStageFlags{ .vertex_bit = true },
+            },
+        },
+    }, null);
+
+    const pipeline_layout = try gc.dev.createPipelineLayout(&vk.PipelineLayoutCreateInfo{
+        .set_layout_count = 1,
+        .p_set_layouts = @ptrCast(&descriptor_set_layout),
+    }, null);
     errdefer gc.dev.destroyPipelineLayout(pipeline_layout, null);
 
     const pipeline = try createPipeline(&gc, pipeline_layout, swapchain.surface_format.format);
@@ -171,6 +235,8 @@ pub fn init(allocator: std.mem.Allocator) !App {
         .index_buffer = index_buffer,
         .pipeline_layout = pipeline_layout,
         .pipeline = pipeline,
+        .uniform_buffer = uniform_buffer,
+        .descriptor_set_layout = descriptor_set_layout,
     };
 }
 
@@ -280,7 +346,35 @@ pub fn run(self: *App) !void {
         const offsets = [_]vk.DeviceSize{0};
         self.gc.dev.cmdBindVertexBuffers(cmdbuf, 0, 1, @ptrCast(&self.vertex_buffer.buffer), &offsets);
         self.gc.dev.cmdBindIndexBuffer(cmdbuf, self.index_buffer.buffer, 0, .uint32);
-        // self.gc.dev.cmdDraw(cmdbuf, 3, 1, 0, 0);
+        // self.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.pipeline_layout, 0, 1, @ptrCast(&vk.WriteDescriptorSet{}));
+        const buffer_info = vk.DescriptorBufferInfo{
+            .buffer = self.uniform_buffer.buffer,
+            .offset = 0,
+            .range = @sizeOf(Mat4),
+        };
+
+        const dummy_image_info: vk.DescriptorImageInfo = undefined;
+        const dummy_texel_view: vk.BufferView = undefined;
+
+        const write = vk.WriteDescriptorSet{
+            .dst_binding = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .uniform_buffer,
+            .p_buffer_info = @ptrCast(&buffer_info),
+            .dst_array_element = 0,
+            .dst_set = .null_handle,
+            .p_image_info = @ptrCast(&dummy_image_info),
+            .p_texel_buffer_view = @ptrCast(&dummy_texel_view),
+        };
+
+        self.gc.dev.cmdPushDescriptorSet(
+            cmdbuf,
+            .graphics,
+            self.pipeline_layout,
+            0, // set index
+            1,
+            @ptrCast(&write),
+        );
         self.gc.dev.cmdDrawIndexed(cmdbuf, indices.len, 1, 0, 0, 0);
         self.gc.dev.cmdEndRendering(cmdbuf);
 
@@ -450,4 +544,21 @@ fn createPipeline(
         @ptrCast(&pipeline),
     );
     return pipeline;
+}
+
+pub fn makeMVP() Mat4 {
+    var projection = za.perspective(45.0, 800.0 / 600.0, 0.1, 100.0);
+    projection.data[1][1] *= -1;
+
+    const view = za.lookAt(
+        Vec3.new(0.0, 0.0, -3.0),
+        Vec3.zero(),
+        Vec3.up(),
+    );
+
+    const model = Mat4.fromTranslate(
+        Vec3.new(0.2, 0.5, 0.0),
+    );
+
+    return Mat4.mul(projection, Mat4.mul(view, model));
 }
