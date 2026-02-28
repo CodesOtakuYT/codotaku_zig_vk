@@ -67,20 +67,24 @@ pub fn main() !void {
 
         // Don't present or resize swapchain while the window is minimized
         if (w == 0 or h == 0) {
-            // c.glfwPollEvents();
+            try checkSDL(c.SDL_WaitEvent(null));
             continue;
         }
 
-        const cmdbuf = cmdbufs[swapchain.image_index];
-
-        var extent = vk.Extent2D{ .width = 800, .height = 600 };
+        var extent = swapchain.extent;
 
         if (state == .suboptimal or extent.width != @as(u32, @intCast(w)) or extent.height != @as(u32, @intCast(h))) {
             extent.width = @intCast(w);
             extent.height = @intCast(h);
+            try gc.dev.deviceWaitIdle();
             try swapchain.recreate(extent);
         }
 
+        const current = swapchain.currentSwapImage();
+        try current.waitForFence(&gc);
+        try gc.dev.resetFences(1, @ptrCast(&current.frame_fence));
+
+        const cmdbuf = cmdbufs[swapchain.image_index];
         try gc.dev.resetCommandBuffer(cmdbuf, .{});
 
         try gc.dev.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
