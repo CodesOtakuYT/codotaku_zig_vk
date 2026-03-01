@@ -9,6 +9,7 @@ const Vec3 = za.Vec3;
 const Mat4 = za.Mat4;
 const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("mesh.zig").Vertex;
+const Texture = @import("texture.zig");
 
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.frag.spv").*;
@@ -41,6 +42,7 @@ swapchain: Swapchain,
 command_pool: vk.CommandPool,
 cmdbufs: []vk.CommandBuffer,
 mesh: Mesh,
+depth_texture: Texture,
 uniform_buffer: Buffer,
 descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
@@ -89,9 +91,9 @@ pub fn init(allocator: std.mem.Allocator) !App {
     }, cmdbufs.ptr);
     errdefer gc.dev.freeCommandBuffers(command_pool, @intCast(cmdbufs.len), cmdbufs.ptr);
 
-    const mesh = try Mesh.initCube(&gc, command_pool);
+    const mesh = try Mesh.initTorus(&gc, command_pool);
 
-    const mvp = makeMVP(0.0);
+    const mvp = makeMVP(0.0, swapchain.extent);
 
     var uniform_buffer = try Buffer.init(
         &gc,
@@ -116,6 +118,12 @@ pub fn init(allocator: std.mem.Allocator) !App {
         },
     }, null);
 
+    const swapchain_extent = swapchain.extent;
+    const depth_texture = try Texture.init(&gc, .{ .width = swapchain_extent.width, .height = swapchain_extent.height, .depth = 1 }, vk.Format.d32_sfloat, .{ .depth_stencil_attachment_bit = true }, .{
+        .device_local_bit = true,
+    });
+    errdefer depth_texture.deinit(&gc);
+
     const pipeline_layout = try gc.dev.createPipelineLayout(&vk.PipelineLayoutCreateInfo{
         .set_layout_count = 1,
         .p_set_layouts = @ptrCast(&descriptor_set_layout),
@@ -138,12 +146,14 @@ pub fn init(allocator: std.mem.Allocator) !App {
         .descriptor_set_layout = descriptor_set_layout,
         .mesh = mesh,
         .start_ticks = start_ticks,
+        .depth_texture = depth_texture,
     };
 }
 
 pub fn deinit(self: *App) void {
     self.gc.dev.deviceWaitIdle() catch {};
 
+    self.depth_texture.deinit(&self.gc);
     self.gc.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
     self.gc.dev.destroyPipeline(self.pipeline, null);
     self.gc.dev.destroyPipelineLayout(self.pipeline_layout, null);
@@ -188,13 +198,18 @@ pub fn run(self: *App) !void {
             try self.gc.dev.deviceWaitIdle();
             try self.swapchain.recreate(extent);
             self.state = .optimal;
+
+            self.depth_texture.deinit(&self.gc);
+            self.depth_texture = try Texture.init(&self.gc, .{ .width = extent.width, .height = extent.height, .depth = 1 }, vk.Format.d32_sfloat, .{ .depth_stencil_attachment_bit = true }, .{
+                .device_local_bit = true,
+            });
         }
 
         const current = self.swapchain.currentSwapImage();
         try current.waitForFence(&self.gc);
         try self.gc.dev.resetFences(1, @ptrCast(&current.frame_fence));
 
-        const mvp = makeMVP(time);
+        const mvp = makeMVP(time, self.swapchain.extent);
         try self.uniform_buffer.mapWrite(&self.gc, Mat4, &.{mvp}, 0);
 
         const cmdbuf = self.cmdbufs[self.swapchain.image_index];
@@ -219,9 +234,9 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
         .flags = .{ .one_time_submit_bit = true },
     });
 
-    self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
-        .image_memory_barrier_count = 1,
-        .p_image_memory_barriers = @ptrCast(&vk.ImageMemoryBarrier2{
+    const image_barriers = [_]vk.ImageMemoryBarrier2{
+        // Barrier for the Swapchain Color Image
+        .{
             .image = self.swapchain.currentImage(),
             .old_layout = .undefined,
             .new_layout = .color_attachment_optimal,
@@ -231,14 +246,38 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
             .dst_stage_mask = .{ .color_attachment_output_bit = true },
             .subresource_range = .{
                 .aspect_mask = .{ .color_bit = true },
-                .layer_count = 1,
+                .base_mip_level = 0,
                 .level_count = 1,
                 .base_array_layer = 0,
-                .base_mip_level = 0,
+                .layer_count = 1,
             },
             .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
             .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-        }),
+        },
+        // Barrier for the Depth Texture
+        .{
+            .image = self.depth_texture.image,
+            .old_layout = .undefined,
+            .new_layout = .depth_attachment_optimal,
+            .src_access_mask = .{},
+            .dst_access_mask = .{ .depth_stencil_attachment_write_bit = true },
+            .src_stage_mask = .{ .early_fragment_tests_bit = true },
+            .dst_stage_mask = .{ .early_fragment_tests_bit = true },
+            .subresource_range = .{
+                .aspect_mask = .{ .depth_bit = true },
+                .base_mip_level = 0,
+                .level_count = 1,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        },
+    };
+
+    self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
+        .image_memory_barrier_count = image_barriers.len,
+        .p_image_memory_barriers = &image_barriers,
     });
 
     self.gc.dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&vk.Viewport{ .x = 0, .y = 0, .width = @floatFromInt(extent.width), .height = @floatFromInt(extent.height), .min_depth = 0, .max_depth = 1 }));
@@ -262,6 +301,15 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
         }),
+        .p_depth_attachment = &vk.RenderingAttachmentInfo{
+            .image_view = self.depth_texture.view,
+            .image_layout = .depth_attachment_optimal,
+            .load_op = .clear,
+            .store_op = .dont_care,
+            .clear_value = .{ .depth_stencil = .{ .depth = 1.0, .stencil = 0 } },
+            .resolve_mode = .{},
+            .resolve_image_layout = .undefined,
+        },
         .view_mask = 0,
     });
 
@@ -377,7 +425,7 @@ fn createPipeline(
         .rasterizer_discard_enable = .false,
         .polygon_mode = .fill,
         .cull_mode = .{ .back_bit = true },
-        .front_face = .clockwise,
+        .front_face = .counter_clockwise,
         .depth_bias_enable = .false,
         .depth_bias_constant_factor = 0,
         .depth_bias_clamp = 0,
@@ -422,7 +470,7 @@ fn createPipeline(
     const pipeline_rendering_create_info = vk.PipelineRenderingCreateInfo{
         .color_attachment_count = 1,
         .p_color_attachment_formats = @ptrCast(&format),
-        .depth_attachment_format = .undefined,
+        .depth_attachment_format = .d32_sfloat,
         .stencil_attachment_format = .undefined,
         .view_mask = 0,
     };
@@ -438,7 +486,17 @@ fn createPipeline(
         .p_viewport_state = &pvsci,
         .p_rasterization_state = &prsci,
         .p_multisample_state = &pmsci,
-        .p_depth_stencil_state = null,
+        .p_depth_stencil_state = &vk.PipelineDepthStencilStateCreateInfo{
+            .depth_test_enable = .true,
+            .depth_write_enable = .true, // Actually write the depth to the buffer
+            .depth_compare_op = .less,
+            .depth_bounds_test_enable = .false,
+            .stencil_test_enable = .false,
+            .front = undefined, // Only needed if stencil_test_enable is TRUE
+            .back = undefined,
+            .min_depth_bounds = 0.0,
+            .max_depth_bounds = 1.0,
+        },
         .p_color_blend_state = &pcbsci,
         .p_dynamic_state = &pdsci,
         .layout = layout,
@@ -458,8 +516,8 @@ fn createPipeline(
     return pipeline;
 }
 
-pub fn makeMVP(time: f32) Mat4 {
-    var projection = za.perspective(45.0, 800.0 / 600.0, 0.1, 100.0);
+pub fn makeMVP(time: f32, swapchain_extent: vk.Extent2D) Mat4 {
+    var projection = za.perspective(45.0, @as(f32, @floatFromInt(swapchain_extent.width)) / @as(f32, @floatFromInt(swapchain_extent.height)), 0.1, 100.0);
     projection.data[1][1] *= -1;
 
     const view = za.lookAt(

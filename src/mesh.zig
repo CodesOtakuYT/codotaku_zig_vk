@@ -30,6 +30,8 @@ pub const Vertex = struct {
     color: Vec3,
 };
 
+const std = @import("std");
+
 pub const Mesh = struct {
     vertex_buffer: Buffer,
     index_buffer: Buffer,
@@ -37,29 +39,115 @@ pub const Mesh = struct {
 
     pub fn initCube(gc: *GraphicsContext, command_pool: vk.CommandPool) !Mesh {
         const vertices = [_]Vertex{
-            .{ .pos = Vec3.new(-0.5, -0.5, 0.5), .color = Vec3.new(1, 0, 0) },
-            .{ .pos = Vec3.new(0.5, -0.5, 0.5), .color = Vec3.new(0, 1, 0) },
-            .{ .pos = Vec3.new(0.5, 0.5, 0.5), .color = Vec3.new(0, 0, 1) },
-            .{ .pos = Vec3.new(-0.5, 0.5, 0.5), .color = Vec3.new(1, 1, 0) },
+            // Front face (Red) - CCW: Bottom-Left, Bottom-Right, Top-Right, Top-Left
+            .{ .pos = Vec3.new(-0.5, -0.5, 0.5), .color = Vec3.new(1, 0, 0) }, // 0
+            .{ .pos = Vec3.new(0.5, -0.5, 0.5), .color = Vec3.new(1, 0, 0) }, // 1
+            .{ .pos = Vec3.new(0.5, 0.5, 0.5), .color = Vec3.new(1, 0, 0) }, // 2
+            .{ .pos = Vec3.new(-0.5, 0.5, 0.5), .color = Vec3.new(1, 0, 0) }, // 3
 
-            .{ .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(1, 0, 1) },
-            .{ .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(0, 1, 1) },
-            .{ .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(1, 1, 1) },
-            .{ .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(0, 0, 0) },
+            // Back face (Green) - CCW: Bottom-Right, Bottom-Left, Top-Left, Top-Right
+            .{ .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(0, 1, 0) }, // 4
+            .{ .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(0, 1, 0) }, // 5
+            .{ .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(0, 1, 0) }, // 6
+            .{ .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(0, 1, 0) }, // 7
+
+            // Top face (Blue) - CCW
+            .{ .pos = Vec3.new(-0.5, 0.5, 0.5), .color = Vec3.new(0, 0, 1) }, // 8
+            .{ .pos = Vec3.new(0.5, 0.5, 0.5), .color = Vec3.new(0, 0, 1) }, // 9
+            .{ .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(0, 0, 1) }, // 10
+            .{ .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(0, 0, 1) }, // 11
+
+            // Bottom face (Yellow)
+            .{ .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(1, 1, 0) }, // 12
+            .{ .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(1, 1, 0) }, // 13
+            .{ .pos = Vec3.new(0.5, -0.5, 0.5), .color = Vec3.new(1, 1, 0) }, // 14
+            .{ .pos = Vec3.new(-0.5, -0.5, 0.5), .color = Vec3.new(1, 1, 0) }, // 15
+
+            // Right face (Magenta)
+            .{ .pos = Vec3.new(0.5, -0.5, 0.5), .color = Vec3.new(1, 0, 1) }, // 16
+            .{ .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(1, 0, 1) }, // 17
+            .{ .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(1, 0, 1) }, // 18
+            .{ .pos = Vec3.new(0.5, 0.5, 0.5), .color = Vec3.new(1, 0, 1) }, // 19
+
+            // Left face (Cyan)
+            .{ .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(0, 1, 1) }, // 20
+            .{ .pos = Vec3.new(-0.5, -0.5, 0.5), .color = Vec3.new(0, 1, 1) }, // 21
+            .{ .pos = Vec3.new(-0.5, 0.5, 0.5), .color = Vec3.new(0, 1, 1) }, // 22
+            .{ .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(0, 1, 1) }, // 23
         };
 
         const indices = [_]u32{
-            0, 1, 2, 2, 3, 0,
-            4, 6, 5, 6, 4, 7,
-            4, 0, 3, 3, 7, 4,
-            1, 5, 6, 6, 2, 1,
-            3, 2, 6, 6, 7, 3,
-            4, 5, 1, 1, 0, 4,
+            0, 1, 2, 2, 3, 0, // Front
+            4, 5, 6, 6, 7, 4, // Back
+            8, 9, 10, 10, 11, 8, // Top
+            12, 13, 14, 14, 15, 12, // Bottom
+            16, 17, 18, 18, 19, 16, // Right
+            20, 21, 22, 22, 23, 20, // Left
         };
 
+        return .init(gc, command_pool, &vertices, &indices);
+    }
+
+    pub fn initTorus(gc: *GraphicsContext, command_pool: vk.CommandPool) !Mesh {
+        const main_segments = 32;
+        const tube_segments = 32;
+        const main_radius = 0.7;
+        const tube_radius = 0.3;
+
+        var vertices = std.ArrayList(Vertex).empty;
+        defer vertices.deinit(gc.allocator);
+        var indices = std.ArrayList(u32).empty;
+        defer indices.deinit(gc.allocator);
+
+        for (0..main_segments + 1) |i| {
+            const u = @as(f32, @floatFromInt(i)) / main_segments * 2.0 * std.math.pi;
+
+            for (0..tube_segments + 1) |j| {
+                const v = @as(f32, @floatFromInt(j)) / tube_segments * 2.0 * std.math.pi;
+
+                // Parametric equations for a torus
+                const x = (main_radius + tube_radius * std.math.cos(v)) * std.math.cos(u);
+                const y = (main_radius + tube_radius * std.math.cos(v)) * std.math.sin(u);
+                const z = tube_radius * std.math.sin(v);
+
+                // Create a color based on the position for a cool gradient
+                const color = Vec3.new(
+                    std.math.cos(u) * 0.5 + 0.5,
+                    std.math.sin(v) * 0.5 + 0.5,
+                    0.5,
+                );
+
+                try vertices.append(gc.allocator, .{
+                    .pos = Vec3.new(x, y, z),
+                    .color = color,
+                });
+            }
+        }
+
+        for (0..main_segments) |i| {
+            for (0..tube_segments) |j| {
+                const first = @as(u32, @intCast(i * (tube_segments + 1) + j));
+                const second = first + tube_segments + 1;
+
+                // First triangle
+                try indices.append(gc.allocator, first);
+                try indices.append(gc.allocator, second);
+                try indices.append(gc.allocator, first + 1);
+
+                // Second triangle
+                try indices.append(gc.allocator, second);
+                try indices.append(gc.allocator, second + 1);
+                try indices.append(gc.allocator, first + 1);
+            }
+        }
+
+        return .init(gc, command_pool, vertices.items, indices.items);
+    }
+
+    pub fn init(gc: *GraphicsContext, command_pool: vk.CommandPool, vertices: []const Vertex, indices: []const u32) !Mesh {
         // reuse your staging logic (inline for now)
-        const vertex_size = @sizeOf(@TypeOf(vertices));
-        const index_size = @sizeOf(@TypeOf(indices));
+        const vertex_size = vertices.len * @sizeOf(Vertex);
+        const index_size = indices.len * @sizeOf(u32);
 
         var staging = try Buffer.init(
             gc,
@@ -92,7 +180,7 @@ pub const Mesh = struct {
         return Mesh{
             .vertex_buffer = vertex_buffer,
             .index_buffer = index_buffer,
-            .index_count = indices.len,
+            .index_count = @intCast(indices.len),
         };
     }
 
