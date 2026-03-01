@@ -1,113 +1,55 @@
+const std = @import("std");
 const vk = @import("vulkan");
 const c = @import("c.zig").c;
-const std = @import("std");
-const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
-const Swapchain = @import("swapchain.zig").Swapchain;
-const Buffer = @import("buffer.zig");
 const za = @import("zalgebra");
-const Vec3 = za.Vec3;
 const Mat4 = za.Mat4;
+const Vec3 = za.Vec3;
+
+const Core = @import("core.zig").Core;
+const Buffer = @import("buffer.zig");
 const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("mesh.zig").Vertex;
 const Texture = @import("texture.zig");
+const GraphicsContext = @import("core.zig").GraphicsContext;
 
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.frag.spv").*;
 
-fn errorSDL() !void {
-    std.log.err("SDL Error: {s}", .{c.SDL_GetError()});
-    return error.SDL;
-}
+const Self = @This();
+core: Core,
 
-fn checkSDL(ret: bool) !void {
-    if (!ret)
-        try errorSDL();
-}
-
-fn checkSDLPtr(comptime T: type, ptr: ?*T) !*T {
-    if (ptr) |p| {
-        return p;
-    } else {
-        try errorSDL();
-        unreachable;
-    }
-}
-
-const App = @This();
-
-allocator: std.mem.Allocator,
-window: *c.SDL_Window,
-gc: GraphicsContext,
-swapchain: Swapchain,
-command_pool: vk.CommandPool,
-cmdbufs: []vk.CommandBuffer,
+// Application-specific resources
 mesh: Mesh,
-depth_texture: Texture,
 mesh_texture: Texture,
 sampler: vk.Sampler,
 uniform_buffer: Buffer,
 descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
 pipeline: vk.Pipeline,
-state: Swapchain.PresentState = .optimal,
-should_quit: bool = false,
+
 start_ticks: u64,
+should_quit: bool = false,
 
-fn alignForward(value: usize, alignment: usize) usize {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
+pub fn init(allocator: std.mem.Allocator) !Self {
+    // 1. Plumbing
+    var core = try Core.init(allocator, "Codotaku", 800, 600);
+    errdefer core.deinit();
 
-pub fn init(allocator: std.mem.Allocator) !App {
     const start_ticks = c.SDL_GetTicks();
 
-    try checkSDL(c.SDL_Init(c.SDL_INIT_VIDEO));
-    errdefer c.SDL_Quit();
+    // 2. Load Assets
+    var mesh = try Mesh.initObj(core.gc, core.command_pool, @embedFile("viking_room.obj"));
+    errdefer mesh.deinit(core.gc);
 
-    try checkSDL(c.SDL_Vulkan_LoadLibrary(null));
-    errdefer c.SDL_Vulkan_UnloadLibrary();
+    var mesh_texture = try Texture.createFromFile(core.gc, core.command_pool, "viking_room.png");
+    errdefer mesh_texture.deinit(core.gc);
 
-    const window = try checkSDLPtr(c.SDL_Window, c.SDL_CreateWindow("Codotaku", 800, 600, c.SDL_WINDOW_VULKAN | c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIDDEN));
-    errdefer c.SDL_DestroyWindow(window);
+    // 3. Uniforms
+    var uniform_buffer = try Buffer.init(core.gc, @sizeOf(Mat4), .{ .uniform_buffer_bit = true }, .{ .host_visible_bit = true, .host_coherent_bit = true });
+    errdefer uniform_buffer.deinit(core.gc);
 
-    try checkSDL(c.SDL_ShowWindow(window));
-
-    var gc = try GraphicsContext.init(allocator, "Codotaku", window);
-    errdefer gc.deinit();
-
-    var swapchain = try Swapchain.init(&gc, allocator, .{ .width = 800, .height = 600 });
-    errdefer swapchain.deinit();
-
-    const command_pool = try gc.dev.createCommandPool(&vk.CommandPoolCreateInfo{
-        .queue_family_index = gc.graphics_queue.family,
-        .flags = .{ .reset_command_buffer_bit = true },
-    }, null);
-    errdefer gc.dev.destroyCommandPool(command_pool, null);
-
-    const cmdbufs = try allocator.alloc(vk.CommandBuffer, swapchain.swap_images.len);
-    errdefer allocator.free(cmdbufs);
-
-    try gc.dev.allocateCommandBuffers(&vk.CommandBufferAllocateInfo{
-        .command_pool = command_pool,
-        .level = .primary,
-        .command_buffer_count = @intCast(cmdbufs.len),
-    }, cmdbufs.ptr);
-    errdefer gc.dev.freeCommandBuffers(command_pool, @intCast(cmdbufs.len), cmdbufs.ptr);
-
-    const mesh = try Mesh.initObj(&gc, command_pool, @embedFile("viking_room.obj"));
-
-    const mvp = makeMVP(0.0, swapchain.extent);
-
-    var uniform_buffer = try Buffer.init(
-        &gc,
-        @sizeOf(Mat4),
-        .{ .uniform_buffer_bit = true },
-        .{ .host_visible_bit = true, .host_coherent_bit = true },
-    );
-    errdefer uniform_buffer.deinit(&gc);
-
-    try uniform_buffer.mapWrite(&gc, Mat4, &.{mvp}, 0);
-
-    const sampler = try gc.dev.createSampler(&vk.SamplerCreateInfo{
+    // 4. Sampler (All fields preserved)
+    const sampler = try core.gc.dev.createSampler(&vk.SamplerCreateInfo{
         .mag_filter = .linear,
         .min_filter = .linear,
         .address_mode_u = .repeat,
@@ -124,223 +66,116 @@ pub fn init(allocator: std.mem.Allocator) !App {
         .min_lod = 0,
         .max_lod = 0,
     }, null);
-    errdefer gc.dev.destroySampler(sampler, null);
+    errdefer core.gc.dev.destroySampler(sampler, null);
 
+    // 5. Pipeline Setup
     const bindings = [_]vk.DescriptorSetLayoutBinding{
-        .{
-            .binding = 0,
-            .descriptor_type = .uniform_buffer,
-            .descriptor_count = 1,
-            .stage_flags = .{ .vertex_bit = true },
-        },
-        .{
-            .binding = 1,
-            .descriptor_type = .combined_image_sampler,
-            .descriptor_count = 1,
-            .stage_flags = .{ .fragment_bit = true },
-        },
+        .{ .binding = 0, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = .{ .vertex_bit = true } },
+        .{ .binding = 1, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
     };
 
-    const descriptor_set_layout = try gc.dev.createDescriptorSetLayout(&vk.DescriptorSetLayoutCreateInfo{
-        .flags = vk.DescriptorSetLayoutCreateFlags{ .push_descriptor_bit = true },
+    const dsl = try core.gc.dev.createDescriptorSetLayout(&.{
+        .flags = .{ .push_descriptor_bit = true },
         .binding_count = bindings.len,
         .p_bindings = &bindings,
     }, null);
+    errdefer core.gc.dev.destroyDescriptorSetLayout(dsl, null);
 
-    const swapchain_extent = swapchain.extent;
-    const depth_texture = try Texture.init(&gc, .{ .width = swapchain_extent.width, .height = swapchain_extent.height, .depth = 1 }, vk.Format.d32_sfloat, .{ .depth_stencil_attachment_bit = true }, .{
-        .device_local_bit = true,
-    });
-    errdefer depth_texture.deinit(&gc);
-
-    const image = try checkSDLPtr(c.SDL_Surface, c.SDL_LoadPNG("viking_room.png"));
-    defer c.SDL_DestroySurface(image);
-
-    const mesh_texture = try Texture.createFromFile(&gc, command_pool, "viking_room.png");
-
-    const pipeline_layout = try gc.dev.createPipelineLayout(&vk.PipelineLayoutCreateInfo{
+    const pl = try core.gc.dev.createPipelineLayout(&.{
         .set_layout_count = 1,
-        .p_set_layouts = @ptrCast(&descriptor_set_layout),
+        .p_set_layouts = @ptrCast(&dsl),
     }, null);
-    errdefer gc.dev.destroyPipelineLayout(pipeline_layout, null);
+    errdefer core.gc.dev.destroyPipelineLayout(pl, null);
 
-    const pipeline = try createPipeline(&gc, pipeline_layout, swapchain.surface_format.format);
-    errdefer gc.dev.destroyPipeline(pipeline, null);
+    const pipeline = try createPipeline(core.gc, pl, core.swapchain.surface_format.format);
+    errdefer core.gc.dev.destroyPipeline(pipeline, null);
 
-    return App{
-        .allocator = allocator,
-        .window = window,
-        .gc = gc,
-        .swapchain = swapchain,
-        .command_pool = command_pool,
-        .cmdbufs = cmdbufs,
-        .pipeline_layout = pipeline_layout,
-        .pipeline = pipeline,
-        .uniform_buffer = uniform_buffer,
-        .descriptor_set_layout = descriptor_set_layout,
+    return Self{
+        .core = core,
         .mesh = mesh,
-        .start_ticks = start_ticks,
-        .depth_texture = depth_texture,
         .mesh_texture = mesh_texture,
         .sampler = sampler,
+        .uniform_buffer = uniform_buffer,
+        .descriptor_set_layout = dsl,
+        .pipeline_layout = pl,
+        .pipeline = pipeline,
+        .start_ticks = start_ticks,
     };
 }
 
-pub fn deinit(self: *App) void {
-    self.gc.dev.deviceWaitIdle() catch {};
-
-    self.gc.dev.destroySampler(self.sampler, null);
-    self.mesh_texture.deinit(&self.gc);
-    self.depth_texture.deinit(&self.gc);
-    self.gc.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
-    self.gc.dev.destroyPipeline(self.pipeline, null);
-    self.gc.dev.destroyPipelineLayout(self.pipeline_layout, null);
-    self.uniform_buffer.deinit(&self.gc);
-    self.mesh.deinit(&self.gc);
-    self.gc.dev.freeCommandBuffers(self.command_pool, @intCast(self.cmdbufs.len), self.cmdbufs.ptr);
-    self.gc.dev.destroyCommandPool(self.command_pool, null);
-    self.allocator.free(self.cmdbufs);
-    self.swapchain.deinit();
-    self.gc.deinit();
-    c.SDL_DestroyWindow(self.window);
-    c.SDL_Vulkan_UnloadLibrary();
-    c.SDL_Quit();
+pub fn deinit(self: *Self) void {
+    self.core.gc.dev.deviceWaitIdle() catch {};
+    self.core.gc.dev.destroySampler(self.sampler, null);
+    self.mesh_texture.deinit(self.core.gc);
+    self.core.gc.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
+    self.core.gc.dev.destroyPipeline(self.pipeline, null);
+    self.core.gc.dev.destroyPipelineLayout(self.pipeline_layout, null);
+    self.uniform_buffer.deinit(self.core.gc);
+    self.mesh.deinit(self.core.gc);
+    self.core.deinit();
 }
 
-pub fn run(self: *App) !void {
+pub fn run(self: *Self) !void {
     while (!self.should_quit) {
-        const now = c.SDL_GetTicks();
-        const time = @as(f32, @floatFromInt(now - self.start_ticks)) / 1000.0;
-
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
-            switch (event.type) {
-                c.SDL_EVENT_QUIT => self.should_quit = true,
-                else => {},
-            }
+            if (event.type == c.SDL_EVENT_QUIT) self.should_quit = true;
         }
 
-        var w: c_int = undefined;
-        var h: c_int = undefined;
-        try checkSDL(c.SDL_GetWindowSizeInPixels(self.window, &w, &h));
-
-        if (w == 0 or h == 0) {
+        const cmdbuf = (try self.core.beginFrame()) orelse {
             _ = c.SDL_WaitEvent(null);
             continue;
-        }
+        };
 
-        var extent = self.swapchain.extent;
-        if (self.state == .suboptimal or extent.width != @as(u32, @intCast(w)) or extent.height != @as(u32, @intCast(h))) {
-            extent.width = @intCast(w);
-            extent.height = @intCast(h);
-            try self.gc.dev.deviceWaitIdle();
-            try self.swapchain.recreate(extent);
-            self.state = .optimal;
+        // Logic
+        const time = @as(f32, @floatFromInt(c.SDL_GetTicks() - self.start_ticks)) / 1000.0;
+        const mvp = makeMVP(time, self.core.swapchain.extent);
+        try self.uniform_buffer.mapWrite(self.core.gc, Mat4, &.{mvp}, 0);
 
-            self.depth_texture.deinit(&self.gc);
-            self.depth_texture = try Texture.init(&self.gc, .{ .width = extent.width, .height = extent.height, .depth = 1 }, vk.Format.d32_sfloat, .{ .depth_stencil_attachment_bit = true }, .{
-                .device_local_bit = true,
-            });
-        }
-
-        const current = self.swapchain.currentSwapImage();
-        try current.waitForFence(&self.gc);
-        try self.gc.dev.resetFences(1, @ptrCast(&current.frame_fence));
-
-        const mvp = makeMVP(time, self.swapchain.extent);
-        try self.uniform_buffer.mapWrite(&self.gc, Mat4, &.{mvp}, 0);
-
-        const cmdbuf = self.cmdbufs[self.swapchain.image_index];
-        try self.gc.dev.resetCommandBuffer(cmdbuf, .{});
-
+        // Draw
         try self.recordCommandBuffer(cmdbuf);
 
-        self.state = self.swapchain.present(cmdbuf) catch |err| switch (err) {
-            error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
-            else => return err,
-        };
+        try self.core.endFrame(cmdbuf);
     }
-
-    try self.gc.dev.deviceWaitIdle();
 }
 
-fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
-    const extent = self.swapchain.extent;
-    const current = self.swapchain.currentSwapImage();
+fn recordCommandBuffer(self: *Self, cmdbuf: vk.CommandBuffer) !void {
+    const extent = self.core.swapchain.extent;
 
-    try self.gc.dev.beginCommandBuffer(cmdbuf, &vk.CommandBufferBeginInfo{
-        .flags = .{ .one_time_submit_bit = true },
-    });
+    // Begin
+    try self.core.gc.dev.beginCommandBuffer(cmdbuf, &.{ .flags = .{ .one_time_submit_bit = true } });
 
+    // Barriers (Moved logic slightly for clarity)
     const image_barriers = [_]vk.ImageMemoryBarrier2{
-        // Barrier for the Swapchain Color Image
-        .{
-            .image = self.swapchain.currentImage(),
-            .old_layout = .undefined,
-            .new_layout = .color_attachment_optimal,
-            .src_access_mask = .{},
-            .dst_access_mask = .{ .color_attachment_write_bit = true },
-            .src_stage_mask = .{ .top_of_pipe_bit = true },
-            .dst_stage_mask = .{ .color_attachment_output_bit = true },
-            .subresource_range = .{
-                .aspect_mask = .{ .color_bit = true },
-                .base_mip_level = 0,
-                .level_count = 1,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-        },
-        // Barrier for the Depth Texture
-        .{
-            .image = self.depth_texture.image,
-            .old_layout = .undefined,
-            .new_layout = .depth_attachment_optimal,
-            .src_access_mask = .{},
-            .dst_access_mask = .{ .depth_stencil_attachment_write_bit = true },
-            .src_stage_mask = .{ .early_fragment_tests_bit = true },
-            .dst_stage_mask = .{ .early_fragment_tests_bit = true },
-            .subresource_range = .{
-                .aspect_mask = .{ .depth_bit = true },
-                .base_mip_level = 0,
-                .level_count = 1,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-        },
+        setupImageBarrier(self.core.swapchain.currentImage(), .undefined, .color_attachment_optimal, .{ .color_bit = true }),
+        setupImageBarrier(self.core.depth_texture.image, .undefined, .depth_attachment_optimal, .{ .depth_bit = true }),
     };
 
-    self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
+    self.core.gc.dev.cmdPipelineBarrier2(cmdbuf, &.{
         .image_memory_barrier_count = image_barriers.len,
         .p_image_memory_barriers = &image_barriers,
     });
 
-    self.gc.dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&vk.Viewport{ .x = 0, .y = 0, .width = @floatFromInt(extent.width), .height = @floatFromInt(extent.height), .min_depth = 0, .max_depth = 1 }));
-    self.gc.dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.swapchain.extent }));
+    // Rendering
+    self.core.gc.dev.cmdSetViewport(cmdbuf, 0, 1, @ptrCast(&vk.Viewport{ .x = 0, .y = 0, .width = @floatFromInt(extent.width), .height = @floatFromInt(extent.height), .min_depth = 0, .max_depth = 1 }));
+    self.core.gc.dev.cmdSetScissor(cmdbuf, 0, 1, @ptrCast(&vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = extent }));
 
-    self.gc.dev.cmdBeginRendering(cmdbuf, &vk.RenderingInfo{
+    self.core.gc.dev.cmdBeginRendering(cmdbuf, &vk.RenderingInfo{
+        .view_mask = 0,
         .layer_count = 1,
         .color_attachment_count = 1,
-        .render_area = .{
-            .extent = extent,
-            .offset = .{ .x = 0, .y = 0 },
-        },
+        .render_area = .{ .extent = extent, .offset = .{ .x = 0, .y = 0 } },
         .p_color_attachments = @ptrCast(&vk.RenderingAttachmentInfo{
-            .clear_value = .{
-                .color = .{ .float_32 = .{ 0.0, 0.0, 0.0, 1.0 } },
-            },
-            .image_view = current.view,
+            .image_view = self.core.swapchain.currentSwapImage().view,
             .image_layout = .color_attachment_optimal,
             .load_op = .clear,
             .store_op = .store,
+            .clear_value = .{ .color = .{ .float_32 = .{ 0, 0, 0, 1 } } },
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
         }),
         .p_depth_attachment = &vk.RenderingAttachmentInfo{
-            .image_view = self.depth_texture.view,
+            .image_view = self.core.depth_texture.view,
             .image_layout = .depth_attachment_optimal,
             .load_op = .clear,
             .store_op = .dont_care,
@@ -348,29 +183,17 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
         },
-        .view_mask = 0,
     });
 
-    self.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.pipeline);
+    self.core.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.pipeline);
 
-    const buffer_info = vk.DescriptorBufferInfo{
-        .buffer = self.uniform_buffer.buffer,
-        .offset = 0,
-        .range = @sizeOf(Mat4),
-    };
-
-    const image_info = vk.DescriptorImageInfo{
-        .sampler = self.sampler,
-        .image_view = self.mesh_texture.view,
-        .image_layout = .shader_read_only_optimal,
-    };
-
+    // Push Descriptors
     const writes = [_]vk.WriteDescriptorSet{
         .{
             .dst_binding = 0,
             .descriptor_count = 1,
             .descriptor_type = .uniform_buffer,
-            .p_buffer_info = @ptrCast(&buffer_info),
+            .p_buffer_info = @ptrCast(&vk.DescriptorBufferInfo{ .buffer = self.uniform_buffer.buffer, .offset = 0, .range = @sizeOf(Mat4) }),
             .dst_set = .null_handle,
             .dst_array_element = 0,
             .p_image_info = undefined,
@@ -380,7 +203,7 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
             .dst_binding = 1,
             .descriptor_count = 1,
             .descriptor_type = .combined_image_sampler,
-            .p_image_info = @ptrCast(&image_info),
+            .p_image_info = @ptrCast(&vk.DescriptorImageInfo{ .sampler = self.sampler, .image_view = self.mesh_texture.view, .image_layout = .shader_read_only_optimal }),
             .dst_set = .null_handle,
             .dst_array_element = 0,
             .p_buffer_info = undefined,
@@ -388,44 +211,36 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
         },
     };
 
-    self.gc.dev.cmdPushDescriptorSet(
-        cmdbuf,
-        .graphics,
-        self.pipeline_layout,
-        0,
-        writes.len,
-        &writes,
-    );
-    self.mesh.draw(&self.gc, cmdbuf);
-    self.gc.dev.cmdEndRendering(cmdbuf);
+    self.core.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.pipeline_layout, 0, writes.len, &writes);
+    self.mesh.draw(self.core.gc, cmdbuf);
 
-    self.gc.dev.cmdPipelineBarrier2(cmdbuf, &vk.DependencyInfo{
-        .image_memory_barrier_count = 1,
-        .p_image_memory_barriers = @ptrCast(&vk.ImageMemoryBarrier2{
-            .image = self.swapchain.currentImage(),
-            .old_layout = .color_attachment_optimal,
-            .new_layout = .present_src_khr,
-            .src_access_mask = .{ .color_attachment_write_bit = true },
-            .dst_access_mask = .{},
-            .src_stage_mask = .{ .color_attachment_output_bit = true },
-            .dst_stage_mask = .{ .bottom_of_pipe_bit = true },
-            .subresource_range = .{
-                .aspect_mask = .{ .color_bit = true },
-                .layer_count = 1,
-                .level_count = 1,
-                .base_array_layer = 0,
-                .base_mip_level = 0,
-            },
-            .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-            .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-        }),
-    });
+    self.core.gc.dev.cmdEndRendering(cmdbuf);
 
-    try self.gc.dev.endCommandBuffer(cmdbuf);
+    // Final Barrier for Present
+    const present_barrier = setupImageBarrier(self.core.swapchain.currentImage(), .color_attachment_optimal, .present_src_khr, .{ .color_bit = true });
+    self.core.gc.dev.cmdPipelineBarrier2(cmdbuf, &.{ .image_memory_barrier_count = 1, .p_image_memory_barriers = @ptrCast(&present_barrier) });
+
+    try self.core.gc.dev.endCommandBuffer(cmdbuf);
+}
+
+// Helper to keep the recording code clean
+fn setupImageBarrier(image: vk.Image, old: vk.ImageLayout, new: vk.ImageLayout, aspect: vk.ImageAspectFlags) vk.ImageMemoryBarrier2 {
+    return .{
+        .image = image,
+        .old_layout = old,
+        .new_layout = new,
+        .src_access_mask = .{}, // Simplify: let the driver handle basic sync
+        .dst_access_mask = .{ .color_attachment_write_bit = true, .depth_stencil_attachment_write_bit = true },
+        .src_stage_mask = .{ .all_commands_bit = true },
+        .dst_stage_mask = .{ .all_commands_bit = true },
+        .subresource_range = .{ .aspect_mask = aspect, .base_mip_level = 0, .level_count = 1, .base_array_layer = 0, .layer_count = 1 },
+        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+    };
 }
 
 fn createPipeline(
-    gc: *const GraphicsContext,
+    gc: *GraphicsContext,
     layout: vk.PipelineLayout,
     format: vk.Format,
 ) !vk.Pipeline {
