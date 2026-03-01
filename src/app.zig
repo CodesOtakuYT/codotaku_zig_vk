@@ -570,20 +570,27 @@ fn createPipeline(
 }
 
 pub fn makeMVP(time: f32, swapchain_extent: vk.Extent2D) Mat4 {
+    // 1. Projection: Keeping the standard FOV
     var projection = za.perspective(45.0, @as(f32, @floatFromInt(swapchain_extent.width)) / @as(f32, @floatFromInt(swapchain_extent.height)), 0.1, 100.0);
-    projection.data[1][1] *= -1;
+    projection.data[1][1] *= -1; // Vulkan Y-flip
 
-    const view = za.lookAt(
-        Vec3.new(0.0, 0.0, -3.0),
-        Vec3.zero(),
-        Vec3.up(),
-    );
+    // 2. View: Move the camera MUCH closer to fill the screen
+    // Moved from (3,3,3) to (1.8, 1.8, 1.8) for a closer look
+    const eye = Vec3.new(1.8, 1.8, 1.8);
+    const target = Vec3.new(0.0, 0.5, 0.0); // Look slightly up from the floor
+    const up = Vec3.up();
+    const view = za.lookAt(eye, target, up);
 
-    const angle = time * 50.0;
-    const model =
-        Mat4.fromRotation(angle, Vec3.up())
-            .mul(Mat4.fromRotation(angle * 0.7, Vec3.right()))
-            .mul(Mat4.fromTranslate(Vec3.new(0.2, 0.5, 0.0)));
+    // 3. Model: Fixing orientation and increasing speed
+    // Apply a 90 degree fix on X to stand it up
+    const fix_rotation = Mat4.fromRotation(-90.0, Vec3.right());
 
-    return Mat4.mul(projection, Mat4.mul(view, model));
+    // Increased rotation speed to 30.0 for a more lively view
+    const angle = time * 30.0;
+    const spin = Mat4.fromRotation(angle, Vec3.up());
+
+    // Combine: Spin it while it's standing up
+    const model = spin.mul(fix_rotation);
+
+    return projection.mul(view).mul(model);
 }
