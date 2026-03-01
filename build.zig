@@ -179,4 +179,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.root_module.addImport("zalgebra", zalgebra.module("zalgebra"));
+
+    const obj_mod = b.dependency("obj", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("obj");
+    exe.root_module.addImport("obj", obj_mod);
 }

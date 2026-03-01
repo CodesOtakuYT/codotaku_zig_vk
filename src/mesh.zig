@@ -3,6 +3,8 @@ const Buffer = @import("buffer.zig");
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const za = @import("zalgebra");
 const Vec3 = za.Vec3;
+const std = @import("std");
+const obj = @import("obj");
 
 pub const Vertex = struct {
     pub const binding_description = vk.VertexInputBindingDescription{
@@ -30,12 +32,68 @@ pub const Vertex = struct {
     color: Vec3,
 };
 
-const std = @import("std");
-
 pub const Mesh = struct {
+    const Index = u32;
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     index_count: u32,
+
+    pub fn initObj(gc: *GraphicsContext, command_pool: vk.CommandPool, data: []const u8) !Mesh {
+        var model = try obj.parseObj(gc.allocator, data);
+        defer model.deinit(gc.allocator);
+
+        var unique_vertices = std.AutoHashMap(obj.Mesh.Index, u32).init(gc.allocator);
+        defer unique_vertices.deinit();
+
+        var out_vertices = std.ArrayList(Vertex).empty;
+        defer out_vertices.deinit(gc.allocator);
+        var out_indices = std.ArrayList(u32).empty;
+        defer out_indices.deinit(gc.allocator);
+
+        for (model.meshes) |m| {
+            var face_offset: usize = 0;
+            // Step through each face defined in the OBJ
+            for (m.num_vertices) |v_count| {
+                // Triangulate n-gons/quads into triangles using a fan
+                // Face with v_count vertices has (v_count - 2) triangles
+                for (0..v_count - 2) |i| {
+                    const corner_indices = [_]usize{ 0, i + 1, i + 2 };
+
+                    for (corner_indices) |idx_offset| {
+                        const idx = m.indices[face_offset + idx_offset];
+                        const result = try unique_vertices.getOrPut(idx);
+
+                        if (!result.found_existing) {
+                            const v_base = idx.vertex.? * 3;
+                            const pos = Vec3.new(
+                                model.vertices[v_base],
+                                model.vertices[v_base + 1],
+                                model.vertices[v_base + 2],
+                            );
+
+                            // Map normals to color for visual debugging
+                            var color = Vec3.new(1.0, 1.0, 1.0);
+                            if (idx.normal) |n_idx| {
+                                const n_base = n_idx * 3;
+                                color = Vec3.new(
+                                    model.normals[n_base] * 0.5 + 0.5,
+                                    model.normals[n_base + 1] * 0.5 + 0.5,
+                                    model.normals[n_base + 2] * 0.5 + 0.5,
+                                );
+                            }
+
+                            result.value_ptr.* = @intCast(out_vertices.items.len);
+                            try out_vertices.append(gc.allocator, .{ .pos = pos, .color = color });
+                        }
+                        try out_indices.append(gc.allocator, result.value_ptr.*);
+                    }
+                }
+                face_offset += v_count;
+            }
+        }
+
+        return .init(gc, command_pool, out_vertices.items, out_indices.items);
+    }
 
     pub fn initCube(gc: *GraphicsContext, command_pool: vk.CommandPool) !Mesh {
         const vertices = [_]Vertex{

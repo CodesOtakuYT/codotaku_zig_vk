@@ -44,6 +44,10 @@
             .url = "git+https://github.com/kooparse/zalgebra#fe19b7816f03d86d56d4fa62f943664edf5d367f",
             .hash = "zalgebra-0.0.0-aaiVSrp2AQBLjd3lvhR0ILaVDHeqOpwNFCp0ZJHj0xhk",
         },
+        .obj = .{
+            .url = "git+https://github.com/chip2n/zig-obj.git#47410383c81d24454e370ffadc0980af7abea522",
+            .hash = "obj-3.0.2-v8OfitvLAADxUf6oMHCiWxjJILklY-IMKXlwX-Pv8rKu",
+        },
     },
     .paths = .{
         "build.zig",

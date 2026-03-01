@@ -91,7 +91,7 @@ pub fn init(allocator: std.mem.Allocator) !App {
     }, cmdbufs.ptr);
     errdefer gc.dev.freeCommandBuffers(command_pool, @intCast(cmdbufs.len), cmdbufs.ptr);
 
-    const mesh = try Mesh.initTorus(&gc, command_pool);
+    const mesh = try Mesh.initObj(&gc, command_pool, @embedFile("viking_room.obj"));
 
     const mvp = makeMVP(0.0, swapchain.extent);
 
@@ -424,7 +424,7 @@ fn createPipeline(
         .depth_clamp_enable = .false,
         .rasterizer_discard_enable = .false,
         .polygon_mode = .fill,
-        .cull_mode = .{ .back_bit = true },
+        .cull_mode = .{ .back_bit = false },
         .front_face = .counter_clockwise,
         .depth_bias_enable = .false,
         .depth_bias_constant_factor = 0,
