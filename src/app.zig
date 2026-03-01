@@ -43,6 +43,8 @@ command_pool: vk.CommandPool,
 cmdbufs: []vk.CommandBuffer,
 mesh: Mesh,
 depth_texture: Texture,
+mesh_texture: Texture,
+sampler: vk.Sampler,
 uniform_buffer: Buffer,
 descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
@@ -105,17 +107,44 @@ pub fn init(allocator: std.mem.Allocator) !App {
 
     try uniform_buffer.mapWrite(&gc, Mat4, &.{mvp}, 0);
 
+    const sampler = try gc.dev.createSampler(&vk.SamplerCreateInfo{
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .address_mode_u = .repeat,
+        .address_mode_v = .repeat,
+        .address_mode_w = .repeat,
+        .anisotropy_enable = .false,
+        .max_anisotropy = 1.0,
+        .border_color = .int_opaque_black,
+        .unnormalized_coordinates = .false,
+        .compare_enable = .false,
+        .compare_op = .always,
+        .mipmap_mode = .linear,
+        .mip_lod_bias = 0,
+        .min_lod = 0,
+        .max_lod = 0,
+    }, null);
+    errdefer gc.dev.destroySampler(sampler, null);
+
+    const bindings = [_]vk.DescriptorSetLayoutBinding{
+        .{
+            .binding = 0,
+            .descriptor_type = .uniform_buffer,
+            .descriptor_count = 1,
+            .stage_flags = .{ .vertex_bit = true },
+        },
+        .{
+            .binding = 1,
+            .descriptor_type = .combined_image_sampler,
+            .descriptor_count = 1,
+            .stage_flags = .{ .fragment_bit = true },
+        },
+    };
+
     const descriptor_set_layout = try gc.dev.createDescriptorSetLayout(&vk.DescriptorSetLayoutCreateInfo{
         .flags = vk.DescriptorSetLayoutCreateFlags{ .push_descriptor_bit = true },
-        .binding_count = 1,
-        .p_bindings = &[_]vk.DescriptorSetLayoutBinding{
-            .{
-                .binding = 0,
-                .descriptor_type = .uniform_buffer,
-                .descriptor_count = 1,
-                .stage_flags = vk.ShaderStageFlags{ .vertex_bit = true },
-            },
-        },
+        .binding_count = bindings.len,
+        .p_bindings = &bindings,
     }, null);
 
     const swapchain_extent = swapchain.extent;
@@ -123,6 +152,11 @@ pub fn init(allocator: std.mem.Allocator) !App {
         .device_local_bit = true,
     });
     errdefer depth_texture.deinit(&gc);
+
+    const image = try checkSDLPtr(c.SDL_Surface, c.SDL_LoadPNG("viking_room.png"));
+    defer c.SDL_DestroySurface(image);
+
+    const mesh_texture = try Texture.createFromFile(&gc, command_pool, "viking_room.png");
 
     const pipeline_layout = try gc.dev.createPipelineLayout(&vk.PipelineLayoutCreateInfo{
         .set_layout_count = 1,
@@ -147,12 +181,16 @@ pub fn init(allocator: std.mem.Allocator) !App {
         .mesh = mesh,
         .start_ticks = start_ticks,
         .depth_texture = depth_texture,
+        .mesh_texture = mesh_texture,
+        .sampler = sampler,
     };
 }
 
 pub fn deinit(self: *App) void {
     self.gc.dev.deviceWaitIdle() catch {};
 
+    self.gc.dev.destroySampler(self.sampler, null);
+    self.mesh_texture.deinit(&self.gc);
     self.depth_texture.deinit(&self.gc);
     self.gc.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
     self.gc.dev.destroyPipeline(self.pipeline, null);
@@ -321,18 +359,33 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
         .range = @sizeOf(Mat4),
     };
 
-    const dummy_image_info: vk.DescriptorImageInfo = undefined;
-    const dummy_texel_view: vk.BufferView = undefined;
+    const image_info = vk.DescriptorImageInfo{
+        .sampler = self.sampler,
+        .image_view = self.mesh_texture.view,
+        .image_layout = .shader_read_only_optimal,
+    };
 
-    const write = vk.WriteDescriptorSet{
-        .dst_binding = 0,
-        .descriptor_count = 1,
-        .descriptor_type = .uniform_buffer,
-        .p_buffer_info = @ptrCast(&buffer_info),
-        .dst_array_element = 0,
-        .dst_set = .null_handle,
-        .p_image_info = @ptrCast(&dummy_image_info),
-        .p_texel_buffer_view = @ptrCast(&dummy_texel_view),
+    const writes = [_]vk.WriteDescriptorSet{
+        .{
+            .dst_binding = 0,
+            .descriptor_count = 1,
+            .descriptor_type = .uniform_buffer,
+            .p_buffer_info = @ptrCast(&buffer_info),
+            .dst_set = .null_handle,
+            .dst_array_element = 0,
+            .p_image_info = undefined,
+            .p_texel_buffer_view = undefined,
+        },
+        .{
+            .dst_binding = 1,
+            .descriptor_count = 1,
+            .descriptor_type = .combined_image_sampler,
+            .p_image_info = @ptrCast(&image_info),
+            .dst_set = .null_handle,
+            .dst_array_element = 0,
+            .p_buffer_info = undefined,
+            .p_texel_buffer_view = undefined,
+        },
     };
 
     self.gc.dev.cmdPushDescriptorSet(
@@ -340,8 +393,8 @@ fn recordCommandBuffer(self: *@This(), cmdbuf: vk.CommandBuffer) !void {
         .graphics,
         self.pipeline_layout,
         0,
-        1,
-        @ptrCast(&write),
+        writes.len,
+        &writes,
     );
     self.mesh.draw(&self.gc, cmdbuf);
     self.gc.dev.cmdEndRendering(cmdbuf);
