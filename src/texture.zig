@@ -1,8 +1,8 @@
-const vk = @import("vulkan");
 const std = @import("std");
-const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
-const Buffer = @import("buffer.zig");
+const vk = @import("vulkan");
 const c = @import("c.zig").c;
+const Buffer = @import("buffer.zig");
+const GraphicsContext = @import("core.zig").GraphicsContext;
 
 const Self = @This();
 
@@ -11,12 +11,9 @@ view: vk.ImageView,
 memory: vk.DeviceMemory,
 extent: vk.Extent3D,
 format: vk.Format,
+layout: vk.ImageLayout,
 
-/// Helper to wrap common SDL surface loading logic
-fn checkSDLPtr(comptime T: type, ptr: ?*T) !*T {
-    if (ptr) |p| return p else return error.SDL;
-}
-
+/// Initializes a raw Vulkan image, allocates memory, and creates a default view.
 pub fn init(
     gc: *const GraphicsContext,
     extent: vk.Extent3D,
@@ -35,8 +32,6 @@ pub fn init(
         .tiling = .optimal,
         .usage = usage,
         .sharing_mode = .exclusive,
-        .queue_family_index_count = 0,
-        .p_queue_family_indices = undefined,
         .initial_layout = .undefined,
     }, null);
     errdefer gc.dev.destroyImage(image, null);
@@ -47,8 +42,7 @@ pub fn init(
 
     try gc.dev.bindImageMemory(image, memory, 0);
 
-    // Determine aspect mask: Depth textures need .depth_bit, Colors need .color_bit
-    const aspect_mask: vk.ImageAspectFlags = if (format == .d32_sfloat or format == .d16_unorm)
+    const aspect_mask: vk.ImageAspectFlags = if (isDepthFormat(format))
         .{ .depth_bit = true }
     else
         .{ .color_bit = true };
@@ -75,6 +69,7 @@ pub fn init(
         .memory = memory,
         .extent = extent,
         .format = format,
+        .layout = .undefined,
     };
 }
 
@@ -84,17 +79,55 @@ pub fn deinit(self: Self, gc: *const GraphicsContext) void {
     gc.dev.freeMemory(self.memory, null);
 }
 
-/// Loads a PNG/Image file, converts to RGBA32, and uploads to GPU memory via staging
+/// Generates a memory barrier for layout transitions using Synchronization2
+pub fn transitionLayout(
+    self: *Self,
+    dev: vk.DeviceProxy,
+    cmdbuf: vk.CommandBuffer,
+    new_layout: vk.ImageLayout,
+) void {
+    const aspect_mask: vk.ImageAspectFlags = if (isDepthFormat(self.format))
+        .{ .depth_bit = true }
+    else
+        .{ .color_bit = true };
+
+    const barrier = vk.ImageMemoryBarrier2{
+        .image = self.image,
+        .old_layout = self.layout,
+        .new_layout = new_layout,
+        .src_access_mask = .{ .memory_read_bit = true, .memory_write_bit = true },
+        .dst_access_mask = .{ .memory_read_bit = true, .memory_write_bit = true },
+        .src_stage_mask = .{ .all_commands_bit = true },
+        .dst_stage_mask = .{ .all_commands_bit = true },
+        .subresource_range = .{
+            .aspect_mask = aspect_mask,
+            .base_mip_level = 0,
+            .level_count = 1,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+    };
+
+    dev.cmdPipelineBarrier2(cmdbuf, &.{
+        .image_memory_barrier_count = 1,
+        .p_image_memory_barriers = @ptrCast(&barrier),
+    });
+
+    self.layout = new_layout;
+}
+
+/// Loads an image file via SDL3 and uploads it to GPU memory
 pub fn createFromFile(
     gc: *const GraphicsContext,
     pool: vk.CommandPool,
     path: [:0]const u8,
 ) !Self {
-    // 1. Load image using SDL3
     const raw_image = try checkSDLPtr(c.SDL_Surface, c.SDL_LoadPNG(path));
     defer c.SDL_DestroySurface(raw_image);
 
-    // 2. Convert to RGBA32 to ensure byte-order matches VK_FORMAT_R8G8B8A8_UNORM
+    // Convert to RGBA32 for consistent mapping to VK_FORMAT_R8G8B8A8_SRGB
     const image = try checkSDLPtr(c.SDL_Surface, c.SDL_ConvertSurface(raw_image, c.SDL_PIXELFORMAT_RGBA32));
     defer c.SDL_DestroySurface(image);
 
@@ -102,8 +135,7 @@ pub fn createFromFile(
     const height: u32 = @intCast(image.h);
     const extent = vk.Extent3D{ .width = width, .height = height, .depth = 1 };
 
-    // 3. Create the actual GPU Texture
-    const self = try Self.init(
+    var self = try Self.init(
         gc,
         extent,
         .r8g8b8a8_srgb,
@@ -112,8 +144,7 @@ pub fn createFromFile(
     );
     errdefer self.deinit(gc);
 
-    // 4. Staging Buffer Setup
-    const bpp = 4; // 4 bytes per pixel (RGBA)
+    const bpp = 4;
     const row_size = width * bpp;
     const total_size = row_size * height;
 
@@ -123,29 +154,25 @@ pub fn createFromFile(
     });
     defer staging.deinit(gc);
 
-    // Copy row-by-row to the staging buffer to strip any SDL pitch/padding
     const ptr = try gc.dev.mapMemory(staging.memory, 0, total_size, .{});
     defer gc.dev.unmapMemory(staging.memory);
 
     const dest_pixels: [*]u8 = @ptrCast(@alignCast(ptr));
     const src_pixels: [*]u8 = @ptrCast(@alignCast(image.pixels.?));
 
+    // Handle potential SDL pitch padding
     for (0..height) |y| {
         const src_offset = y * @as(usize, @intCast(image.pitch));
         const dst_offset = y * row_size;
-        @memcpy(
-            dest_pixels[dst_offset .. dst_offset + row_size],
-            src_pixels[src_offset .. src_offset + row_size],
-        );
+        @memcpy(dest_pixels[dst_offset .. dst_offset + row_size], src_pixels[src_offset .. src_offset + row_size]);
     }
 
-    // 5. Submit the copy command to the GPU
     try self.copyFromBuffer(gc, pool, staging.buffer);
 
     return self;
 }
 
-fn copyFromBuffer(self: Self, gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
+fn copyFromBuffer(self: *Self, gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
     var cmdbuf: vk.CommandBuffer = undefined;
     try gc.dev.allocateCommandBuffers(&.{
         .command_pool = pool,
@@ -154,20 +181,10 @@ fn copyFromBuffer(self: Self, gc: *const GraphicsContext, pool: vk.CommandPool, 
     }, @ptrCast(&cmdbuf));
     defer gc.dev.freeCommandBuffers(pool, 1, @ptrCast(&cmdbuf));
 
-    try gc.dev.beginCommandBuffer(cmdbuf, &.{
-        .flags = .{ .one_time_submit_bit = true },
-    });
+    try gc.dev.beginCommandBuffer(cmdbuf, &.{ .flags = .{ .one_time_submit_bit = true } });
 
-    const range = vk.ImageSubresourceRange{
-        .aspect_mask = .{ .color_bit = true },
-        .base_mip_level = 0,
-        .level_count = 1,
-        .base_array_layer = 0,
-        .layer_count = 1,
-    };
-
-    // Layout Transition: Undefined -> Transfer Destination
-    insertImageBarrier(gc.dev, cmdbuf, self.image, range, .undefined, .transfer_dst_optimal, .{}, .{ .transfer_write_bit = true }, .{ .top_of_pipe_bit = true }, .{ .all_transfer_bit = true });
+    // Transition to Transfer Dst
+    self.transitionLayout(gc.dev, cmdbuf, .transfer_dst_optimal);
 
     const region = vk.BufferImageCopy{
         .buffer_offset = 0,
@@ -185,10 +202,8 @@ fn copyFromBuffer(self: Self, gc: *const GraphicsContext, pool: vk.CommandPool, 
 
     gc.dev.cmdCopyBufferToImage(cmdbuf, buffer, self.image, .transfer_dst_optimal, 1, @ptrCast(&region));
 
-    // Layout Transition: Transfer Destination -> Shader Read Only (ready for Fragment Shader)
-    insertImageBarrier(gc.dev, cmdbuf, self.image, range, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_write_bit = true }, .{ .shader_read_bit = true }, .{
-        .all_transfer_bit = true,
-    }, .{ .fragment_shader_bit = true });
+    // Transition to Shader Read
+    self.transitionLayout(gc.dev, cmdbuf, .shader_read_only_optimal);
 
     try gc.dev.endCommandBuffer(cmdbuf);
 
@@ -201,32 +216,13 @@ fn copyFromBuffer(self: Self, gc: *const GraphicsContext, pool: vk.CommandPool, 
     try gc.dev.queueWaitIdle(gc.graphics_queue.handle);
 }
 
-fn insertImageBarrier(
-    dev: vk.DeviceProxy,
-    cmdbuf: vk.CommandBuffer,
-    image: vk.Image,
-    range: vk.ImageSubresourceRange,
-    old_layout: vk.ImageLayout,
-    new_layout: vk.ImageLayout,
-    src_access: vk.AccessFlags2,
-    dst_access: vk.AccessFlags2,
-    src_stage: vk.PipelineStageFlags2,
-    dst_stage: vk.PipelineStageFlags2,
-) void {
-    const barrier = vk.ImageMemoryBarrier2{
-        .image = image,
-        .subresource_range = range,
-        .old_layout = old_layout,
-        .new_layout = new_layout,
-        .src_access_mask = src_access,
-        .dst_access_mask = dst_access,
-        .src_stage_mask = src_stage,
-        .dst_stage_mask = dst_stage,
-        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
-        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+fn isDepthFormat(format: vk.Format) bool {
+    return switch (format) {
+        .d16_unorm, .d32_sfloat, .d16_unorm_s8_uint, .d24_unorm_s8_uint, .d32_sfloat_s8_uint => true,
+        else => false,
     };
-    dev.cmdPipelineBarrier2(cmdbuf, &.{
-        .image_memory_barrier_count = 1,
-        .p_image_memory_barriers = @ptrCast(&barrier),
-    });
+}
+
+fn checkSDLPtr(comptime T: type, ptr: ?*T) !*T {
+    if (ptr) |p| return p else return error.SDL;
 }

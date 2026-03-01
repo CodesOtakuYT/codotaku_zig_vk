@@ -32,8 +32,6 @@ pub const Core = struct {
         ));
         errdefer c.SDL_DestroyWindow(window);
 
-        try checkSDL(c.SDL_ShowWindow(window));
-
         // Fix: Heap allocate the GC so pointers to it remain valid after Core is moved/returned
         const gc = try allocator.create(GraphicsContext);
         errdefer allocator.destroy(gc);
@@ -63,6 +61,8 @@ pub const Core = struct {
             .device_local_bit = true,
         });
         errdefer depth_texture.deinit(gc);
+
+        try checkSDL(c.SDL_ShowWindow(window));
 
         return Core{
             .allocator = allocator,

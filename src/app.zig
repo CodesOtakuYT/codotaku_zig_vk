@@ -145,15 +145,11 @@ fn recordCommandBuffer(self: *Self, cmdbuf: vk.CommandBuffer) !void {
     // Begin
     try self.core.gc.dev.beginCommandBuffer(cmdbuf, &.{ .flags = .{ .one_time_submit_bit = true } });
 
-    // Barriers (Moved logic slightly for clarity)
-    const image_barriers = [_]vk.ImageMemoryBarrier2{
-        setupImageBarrier(self.core.swapchain.currentImage(), .undefined, .color_attachment_optimal, .{ .color_bit = true }),
-        setupImageBarrier(self.core.depth_texture.image, .undefined, .depth_attachment_optimal, .{ .depth_bit = true }),
-    };
-
+    self.core.depth_texture.transitionLayout(self.core.gc.dev, cmdbuf, .depth_attachment_optimal);
+    const swap_barrier = setupImageBarrier(self.core.swapchain.currentImage(), .undefined, .color_attachment_optimal, .{ .color_bit = true });
     self.core.gc.dev.cmdPipelineBarrier2(cmdbuf, &.{
-        .image_memory_barrier_count = image_barriers.len,
-        .p_image_memory_barriers = &image_barriers,
+        .image_memory_barrier_count = 1,
+        .p_image_memory_barriers = @ptrCast(&swap_barrier),
     });
 
     // Rendering
