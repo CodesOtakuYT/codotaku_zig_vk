@@ -1,3 +1,5 @@
 #! /bin/bash
 glslc shaders/triangle.vert -o src/shaders/triangle.vert.spv
 glslc shaders/triangle.frag -o src/shaders/triangle.frag.spv
+glslc shaders/skybox.vert -o src/shaders/skybox.vert.spv
+glslc shaders/skybox.frag -o src/shaders/skybox.frag.spv

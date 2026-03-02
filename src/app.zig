@@ -12,9 +12,12 @@ const Vertex = @import("mesh.zig").Vertex;
 const Texture = @import("texture.zig");
 const GraphicsContext = @import("core.zig").GraphicsContext;
 const Camera = @import("camera.zig");
+const Pipeline = @import("pipeline.zig");
 
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.frag.spv").*;
+const skybox_vert_spv align(@alignOf(u32)) = @embedFile("shaders/skybox.vert.spv").*;
+const skybox_frag_spv align(@alignOf(u32)) = @embedFile("shaders/skybox.frag.spv").*;
 
 const Self = @This();
 core: Core,
@@ -24,10 +27,12 @@ mesh: Mesh,
 mesh_texture: Texture,
 sampler: vk.Sampler,
 uniform_buffer: Buffer,
-descriptor_set_layout: vk.DescriptorSetLayout,
-pipeline_layout: vk.PipelineLayout,
-pipeline: vk.Pipeline,
+pipeline: Pipeline,
 camera: Camera,
+
+skybox_texture: Texture,
+skybox_sampler: vk.Sampler,
+skybox_pipeline: Pipeline,
 
 start_ticks: u64,
 should_quit: bool = false,
@@ -71,26 +76,62 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     errdefer core.gc.dev.destroySampler(sampler, null);
 
     // 5. Pipeline Setup
-    const bindings = [_]vk.DescriptorSetLayoutBinding{
-        .{ .binding = 0, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = .{ .vertex_bit = true } },
-        .{ .binding = 1, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
-    };
+    // init:
+    const pipeline = try Pipeline.init(core.gc, .{
+        .vert_spv = &vert_spv,
+        .frag_spv = &frag_spv,
+        .color_format = core.swapchain.surface_format.format,
+        .bindings = &.{
+            .{ .binding = 0, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = .{ .vertex_bit = true } },
+            .{ .binding = 1, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
+        },
+    });
 
-    const dsl = try core.gc.dev.createDescriptorSetLayout(&.{
-        .flags = .{ .push_descriptor_bit = true },
-        .binding_count = bindings.len,
-        .p_bindings = &bindings,
+    var skybox_texture = try Texture.createCubemapFromFiles(core.gc, core.command_pool, .{
+        "textures/skybox/posx.png", // +X (right)
+        "textures/skybox/negx.png", // -X (left)
+        "textures/skybox/posy.png", // +Y (up)
+        "textures/skybox/negy.png", // -Y (down)
+        "textures/skybox/posz.png", // +Z (front)
+        "textures/skybox/negz.png", // -Z (back)
+    });
+    errdefer skybox_texture.deinit(core.gc);
+
+    const skybox_sampler = try core.gc.dev.createSampler(&vk.SamplerCreateInfo{
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .address_mode_u = .clamp_to_edge, // cubemaps should clamp, not repeat
+        .address_mode_v = .clamp_to_edge,
+        .address_mode_w = .clamp_to_edge,
+        .anisotropy_enable = .false,
+        .max_anisotropy = 1.0,
+        .border_color = .int_opaque_black,
+        .unnormalized_coordinates = .false,
+        .compare_enable = .false,
+        .compare_op = .always,
+        .mipmap_mode = .linear,
+        .mip_lod_bias = 0,
+        .min_lod = 0,
+        .max_lod = 0,
     }, null);
-    errdefer core.gc.dev.destroyDescriptorSetLayout(dsl, null);
+    errdefer core.gc.dev.destroySampler(skybox_sampler, null);
 
-    const pl = try core.gc.dev.createPipelineLayout(&.{
-        .set_layout_count = 1,
-        .p_set_layouts = @ptrCast(&dsl),
-    }, null);
-    errdefer core.gc.dev.destroyPipelineLayout(pl, null);
-
-    const pipeline = try createPipeline(core.gc, pl, core.swapchain.surface_format.format);
-    errdefer core.gc.dev.destroyPipeline(pipeline, null);
+    const skybox_pipeline = try Pipeline.init(core.gc, .{
+        .vert_spv = &skybox_vert_spv,
+        .frag_spv = &skybox_frag_spv,
+        .color_format = core.swapchain.surface_format.format,
+        .bindings = &.{
+            .{ .binding = 0, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
+        },
+        .push_constant_ranges = &.{
+            .{ .stage_flags = .{ .vertex_bit = true }, .offset = 0, .size = @sizeOf(Mat4) * 2 },
+        },
+        .vertex_input = .none,
+        .cull_mode = .{},
+        .depth_write = false,
+        .depth_compare_op = .less_or_equal,
+    });
+    errdefer skybox_pipeline.deinit(core.gc);
 
     return Self{
         .core = core,
@@ -98,9 +139,10 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .mesh_texture = mesh_texture,
         .sampler = sampler,
         .uniform_buffer = uniform_buffer,
-        .descriptor_set_layout = dsl,
-        .pipeline_layout = pl,
         .pipeline = pipeline,
+        .skybox_texture = skybox_texture,
+        .skybox_sampler = skybox_sampler,
+        .skybox_pipeline = skybox_pipeline,
         .start_ticks = start_ticks,
         .camera = Camera.init(Vec3.new(1.8, 1.8, 1.8), Vec3.new(0.0, 0.5, 0.0), Vec3.up()),
     };
@@ -108,11 +150,12 @@ pub fn init(allocator: std.mem.Allocator) !Self {
 
 pub fn deinit(self: *Self) void {
     self.core.gc.dev.deviceWaitIdle() catch {};
+    self.skybox_pipeline.deinit(self.core.gc);
+    self.core.gc.dev.destroySampler(self.skybox_sampler, null);
+    self.skybox_texture.deinit(self.core.gc);
     self.core.gc.dev.destroySampler(self.sampler, null);
     self.mesh_texture.deinit(self.core.gc);
-    self.core.gc.dev.destroyDescriptorSetLayout(self.descriptor_set_layout, null);
-    self.core.gc.dev.destroyPipeline(self.pipeline, null);
-    self.core.gc.dev.destroyPipelineLayout(self.pipeline_layout, null);
+    self.pipeline.deinit(self.core.gc);
     self.uniform_buffer.deinit(self.core.gc);
     self.mesh.deinit(self.core.gc);
     self.core.deinit();
@@ -189,7 +232,41 @@ fn recordCommandBuffer(self: *Self, cmdbuf: vk.CommandBuffer) !void {
         },
     });
 
-    self.core.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.pipeline);
+    // --- Skybox ---
+    self.core.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.skybox_pipeline.handle);
+
+    // Strip translation from view matrix
+    var sky_view = self.camera.getViewMatrix();
+    sky_view.data[3] = .{ 0, 0, 0, 1 }; // strip translation
+
+    const sky_push = [2]Mat4{ self.camera.getProjMatrix(extent), sky_view };
+    self.core.gc.dev.cmdPushConstants(
+        cmdbuf,
+        self.skybox_pipeline.layout,
+        .{ .vertex_bit = true },
+        0,
+        @sizeOf(@TypeOf(sky_push)),
+        &sky_push,
+    );
+
+    self.core.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.skybox_pipeline.layout, 0, 1, @ptrCast(&vk.WriteDescriptorSet{
+        .dst_binding = 0,
+        .descriptor_count = 1,
+        .descriptor_type = .combined_image_sampler,
+        .p_image_info = @ptrCast(&vk.DescriptorImageInfo{
+            .sampler = self.skybox_sampler,
+            .image_view = self.skybox_texture.view,
+            .image_layout = .shader_read_only_optimal,
+        }),
+        .dst_set = .null_handle,
+        .dst_array_element = 0,
+        .p_buffer_info = undefined,
+        .p_texel_buffer_view = undefined,
+    }));
+
+    self.core.gc.dev.cmdDraw(cmdbuf, 3, 1, 0, 0);
+
+    self.core.gc.dev.cmdBindPipeline(cmdbuf, .graphics, self.pipeline.handle);
 
     // Push Descriptors
     const writes = [_]vk.WriteDescriptorSet{
@@ -215,7 +292,7 @@ fn recordCommandBuffer(self: *Self, cmdbuf: vk.CommandBuffer) !void {
         },
     };
 
-    self.core.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.pipeline_layout, 0, writes.len, &writes);
+    self.core.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.pipeline.layout, 0, writes.len, &writes);
     self.mesh.draw(self.core.gc, cmdbuf);
 
     self.core.gc.dev.cmdEndRendering(cmdbuf);

@@ -36,16 +36,20 @@ pub fn init(eye: Vec3, target: Vec3, up: Vec3) Self {
         .up = up,
     };
 }
+pub fn getViewMatrix(self: Self) Mat4 {
+    return za.lookAt(self.eye, self.target, self.up);
+}
 
-pub fn getDescriptorMatrix(self: Self, extent: vk.Extent2D) Mat4 {
+pub fn getProjMatrix(self: Self, extent: vk.Extent2D) Mat4 {
     const aspect = @as(f32, @floatFromInt(extent.width)) / @as(f32, @floatFromInt(extent.height));
     var projection = za.perspective(self.fov, aspect, self.near, self.far);
-
-    // Vulkan Clip Space Y-axis points down
     projection.data[1][1] *= -1;
+    return projection;
+}
 
-    const view = za.lookAt(self.eye, self.target, self.up);
-    return projection.mul(view);
+// Keep existing one but implement via the two above to avoid duplication
+pub fn getDescriptorMatrix(self: Self, extent: vk.Extent2D) Mat4 {
+    return self.getProjMatrix(extent).mul(self.getViewMatrix());
 }
 
 pub fn onEvent(self: *Self, event: c.SDL_Event, window: ?*c.SDL_Window) void {

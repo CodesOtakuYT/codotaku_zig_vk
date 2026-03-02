@@ -104,7 +104,7 @@ pub fn transitionLayout(
             .base_mip_level = 0,
             .level_count = 1,
             .base_array_layer = 0,
-            .layer_count = 1,
+            .layer_count = vk.REMAINING_ARRAY_LAYERS,
         },
         .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
         .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
@@ -216,6 +216,159 @@ fn copyFromBuffer(self: *Self, gc: *const GraphicsContext, pool: vk.CommandPool,
     try gc.dev.queueWaitIdle(gc.graphics_queue.handle);
 }
 
+/// Initialize a cubemap image (6 array layers)
+pub fn initCubemap(
+    gc: *const GraphicsContext,
+    extent: vk.Extent3D,
+    format: vk.Format,
+    usage: vk.ImageUsageFlags,
+    memory_flags: vk.MemoryPropertyFlags,
+) !Self {
+    const image = try gc.dev.createImage(&vk.ImageCreateInfo{
+        .flags = .{ .cube_compatible_bit = true }, // <-- required
+        .image_type = .@"2d",
+        .format = format,
+        .extent = extent,
+        .mip_levels = 1,
+        .array_layers = 6, // <-- 6 faces
+        .samples = .{ .@"1_bit" = true },
+        .tiling = .optimal,
+        .usage = usage,
+        .sharing_mode = .exclusive,
+        .initial_layout = .undefined,
+    }, null);
+    errdefer gc.dev.destroyImage(image, null);
+
+    const mem_reqs = gc.dev.getImageMemoryRequirements(image);
+    const memory = try gc.allocate(mem_reqs, memory_flags);
+    errdefer gc.dev.freeMemory(memory, null);
+
+    try gc.dev.bindImageMemory(image, memory, 0);
+
+    const view = try gc.dev.createImageView(&vk.ImageViewCreateInfo{
+        .flags = .{},
+        .image = image,
+        .view_type = .cube, // <-- cube view
+        .format = format,
+        .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
+        .subresource_range = .{
+            .aspect_mask = .{ .color_bit = true },
+            .base_mip_level = 0,
+            .level_count = 1,
+            .base_array_layer = 0,
+            .layer_count = 6, // <-- all 6 faces
+        },
+    }, null);
+
+    return Self{
+        .image = image,
+        .view = view,
+        .memory = memory,
+        .extent = extent,
+        .format = format,
+        .layout = .undefined,
+    };
+}
+
+/// Load 6 face images: +X, -X, +Y, -Y, +Z, -Z
+pub fn createCubemapFromFiles(
+    gc: *const GraphicsContext,
+    pool: vk.CommandPool,
+    paths: [6][:0]const u8,
+) !Self {
+    // Load all 6 faces, assume same dimensions
+    var surfaces: [6]*c.SDL_Surface = undefined;
+    var converted: [6]*c.SDL_Surface = undefined;
+
+    for (paths, 0..) |path, i| {
+        surfaces[i] = try checkSDLPtr(c.SDL_Surface, c.SDL_LoadPNG(path));
+        converted[i] = try checkSDLPtr(c.SDL_Surface, c.SDL_ConvertSurface(surfaces[i], c.SDL_PIXELFORMAT_RGBA32));
+        c.SDL_DestroySurface(surfaces[i]);
+    }
+    defer for (converted) |s| c.SDL_DestroySurface(s);
+
+    const width: u32 = @intCast(converted[0].w);
+    const height: u32 = @intCast(converted[0].h);
+    const extent = vk.Extent3D{ .width = width, .height = height, .depth = 1 };
+
+    var self = try Self.initCubemap(
+        gc,
+        extent,
+        .r8g8b8a8_srgb,
+        .{ .transfer_dst_bit = true, .sampled_bit = true },
+        .{ .device_local_bit = true },
+    );
+    errdefer self.deinit(gc);
+
+    const bpp = 4;
+    const face_size = width * height * bpp;
+    const total_size = face_size * 6;
+
+    var staging = try Buffer.init(gc, total_size, .{ .transfer_src_bit = true }, .{
+        .host_visible_bit = true,
+        .host_coherent_bit = true,
+    });
+    defer staging.deinit(gc);
+
+    const ptr = try gc.dev.mapMemory(staging.memory, 0, total_size, .{});
+    const dest: [*]u8 = @ptrCast(@alignCast(ptr));
+
+    for (converted, 0..) |face, i| {
+        const row_size = width * bpp;
+        const face_offset = i * face_size;
+        const src: [*]u8 = @ptrCast(@alignCast(face.pixels.?));
+        for (0..height) |y| {
+            const src_off = y * @as(usize, @intCast(face.pitch));
+            const dst_off = face_offset + y * row_size;
+            @memcpy(dest[dst_off .. dst_off + row_size], src[src_off .. src_off + row_size]);
+        }
+    }
+    gc.dev.unmapMemory(staging.memory);
+
+    try self.copyFromBufferCubemap(gc, pool, staging.buffer, face_size);
+    return self;
+}
+
+fn copyFromBufferCubemap(self: *Self, gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer, face_size: u32) !void {
+    var cmdbuf: vk.CommandBuffer = undefined;
+    try gc.dev.allocateCommandBuffers(&.{
+        .command_pool = pool,
+        .level = .primary,
+        .command_buffer_count = 1,
+    }, @ptrCast(&cmdbuf));
+    defer gc.dev.freeCommandBuffers(pool, 1, @ptrCast(&cmdbuf));
+
+    try gc.dev.beginCommandBuffer(cmdbuf, &.{ .flags = .{ .one_time_submit_bit = true } });
+    self.transitionLayout(gc.dev, cmdbuf, .transfer_dst_optimal);
+
+    var regions: [6]vk.BufferImageCopy = undefined;
+    for (0..6) |i| {
+        regions[i] = .{
+            .buffer_offset = @intCast(i * face_size),
+            .buffer_row_length = 0,
+            .buffer_image_height = 0,
+            .image_subresource = .{
+                .aspect_mask = .{ .color_bit = true },
+                .mip_level = 0,
+                .base_array_layer = @intCast(i), // <-- each face = one layer
+                .layer_count = 1,
+            },
+            .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .image_extent = self.extent,
+        };
+    }
+
+    gc.dev.cmdCopyBufferToImage(cmdbuf, buffer, self.image, .transfer_dst_optimal, 6, @ptrCast(&regions[0]));
+    self.transitionLayout(gc.dev, cmdbuf, .shader_read_only_optimal);
+    try gc.dev.endCommandBuffer(cmdbuf);
+
+    try gc.dev.queueSubmit(gc.graphics_queue.handle, 1, @ptrCast(&vk.SubmitInfo{
+        .command_buffer_count = 1,
+        .p_command_buffers = (&cmdbuf)[0..1],
+    }), .null_handle);
+    try gc.dev.queueWaitIdle(gc.graphics_queue.handle);
+}
+
 fn isDepthFormat(format: vk.Format) bool {
     return switch (format) {
         .d16_unorm, .d32_sfloat, .d16_unorm_s8_uint, .d24_unorm_s8_uint, .d32_sfloat_s8_uint => true,
@@ -224,5 +377,8 @@ fn isDepthFormat(format: vk.Format) bool {
 }
 
 fn checkSDLPtr(comptime T: type, ptr: ?*T) !*T {
-    if (ptr) |p| return p else return error.SDL;
+    if (ptr) |p| return p else {
+        std.log.err("SDL: {s}", .{c.SDL_GetError()});
+        return error.SDL;
+    }
 }

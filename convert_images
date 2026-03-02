@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+# Check if a directory argument was provided
+if [ -z "$1" ]; then
+  echo "Usage: $0 /path/to/directory"
+  exit 1
+fi
+
+dir="$1"
+
+# Check if the path is a valid directory
+if [ ! -d "$dir" ]; then
+  echo "Error: '$dir' is not a valid directory"
+  exit 1
+fi
+
+# Loop through jpg and jpeg files
+for img in "$dir"/*.jpg "$dir"/*.jpeg; do
+  [ -e "$img" ] || continue
+  magick "$img" "${img%.*}.png"
+done
+
+echo "Conversion complete."
