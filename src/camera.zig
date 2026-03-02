@@ -18,7 +18,7 @@ yaw: f32 = -90.0,
 pitch: f32 = 0.0,
 
 // --- Config ---
-fov: f32 = 45.0,
+fov: f32 = 70.0,
 near: f32 = 0.1,
 far: f32 = 100.0,
 mouse_sensitivity: f32 = 0.1,

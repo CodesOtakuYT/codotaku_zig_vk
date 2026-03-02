@@ -85,6 +85,9 @@ pub fn init(allocator: std.mem.Allocator) !Self {
             .{ .binding = 0, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = .{ .vertex_bit = true } },
             .{ .binding = 1, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
         },
+        .push_constant_ranges = &.{
+            .{ .stage_flags = .{ .vertex_bit = true }, .offset = 0, .size = @sizeOf(Mat4) },
+        },
     });
 
     var skybox_texture = try Texture.createCubemapFromFiles(core.gc, core.command_pool, .{
@@ -293,6 +296,16 @@ fn recordCommandBuffer(self: *Self, cmdbuf: vk.CommandBuffer) !void {
     };
 
     self.core.gc.dev.cmdPushDescriptorSet(cmdbuf, .graphics, self.pipeline.layout, 0, writes.len, &writes);
+    // Rotate -90 degrees around X to fix viking room orientation
+    const model = Mat4.fromRotation(-90.0, Vec3.new(1.0, 0.0, 0.0));
+    self.core.gc.dev.cmdPushConstants(
+        cmdbuf,
+        self.pipeline.layout,
+        .{ .vertex_bit = true },
+        0,
+        @sizeOf(Mat4),
+        &model,
+    );
     self.mesh.draw(self.core.gc, cmdbuf);
 
     self.core.gc.dev.cmdEndRendering(cmdbuf);

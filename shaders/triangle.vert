@@ -9,7 +9,11 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 mvp;
 } camera;
 
+layout(push_constant) uniform PushConstants {
+    mat4 model;
+} push;
+
 void main() {
-    gl_Position = camera.mvp * vec4(a_pos, 1.0);
+    gl_Position = camera.mvp * push.model * vec4(a_pos, 1.0);
     v_uv = a_uv;
 }
