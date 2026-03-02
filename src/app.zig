@@ -11,6 +11,7 @@ const Mesh = @import("mesh.zig").Mesh;
 const Vertex = @import("mesh.zig").Vertex;
 const Texture = @import("texture.zig");
 const GraphicsContext = @import("core.zig").GraphicsContext;
+const Camera = @import("camera.zig");
 
 const vert_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("shaders/triangle.frag.spv").*;
@@ -26,6 +27,7 @@ uniform_buffer: Buffer,
 descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
 pipeline: vk.Pipeline,
+camera: Camera,
 
 start_ticks: u64,
 should_quit: bool = false,
@@ -100,6 +102,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .pipeline_layout = pl,
         .pipeline = pipeline,
         .start_ticks = start_ticks,
+        .camera = Camera.init(Vec3.new(1.8, 1.8, 1.8), Vec3.new(0.0, 0.5, 0.0), Vec3.up()),
     };
 }
 
@@ -119,6 +122,7 @@ pub fn run(self: *Self) !void {
     while (!self.should_quit) {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
+            self.camera.onEvent(event, self.core.window);
             if (event.type == c.SDL_EVENT_QUIT) self.should_quit = true;
         }
 
@@ -128,8 +132,12 @@ pub fn run(self: *Self) !void {
         };
 
         // Logic
-        const time = @as(f32, @floatFromInt(c.SDL_GetTicks() - self.start_ticks)) / 1000.0;
-        const mvp = makeMVP(time, self.core.swapchain.extent);
+        const current_ticks = c.SDL_GetTicks();
+        // Calculate difference in milliseconds, then convert to seconds (f32)
+        const dt = @as(f32, @floatFromInt(current_ticks - self.start_ticks)) / 1000.0;
+        self.start_ticks = current_ticks;
+        self.camera.update(dt);
+        const mvp = self.camera.getDescriptorMatrix(self.core.swapchain.extent);
         try self.uniform_buffer.mapWrite(self.core.gc, Mat4, &.{mvp}, 0);
 
         // Draw
@@ -378,30 +386,4 @@ fn createPipeline(
         @ptrCast(&pipeline),
     );
     return pipeline;
-}
-
-pub fn makeMVP(time: f32, swapchain_extent: vk.Extent2D) Mat4 {
-    // 1. Projection: Keeping the standard FOV
-    var projection = za.perspective(45.0, @as(f32, @floatFromInt(swapchain_extent.width)) / @as(f32, @floatFromInt(swapchain_extent.height)), 0.1, 100.0);
-    projection.data[1][1] *= -1; // Vulkan Y-flip
-
-    // 2. View: Move the camera MUCH closer to fill the screen
-    // Moved from (3,3,3) to (1.8, 1.8, 1.8) for a closer look
-    const eye = Vec3.new(1.8, 1.8, 1.8);
-    const target = Vec3.new(0.0, 0.5, 0.0); // Look slightly up from the floor
-    const up = Vec3.up();
-    const view = za.lookAt(eye, target, up);
-
-    // 3. Model: Fixing orientation and increasing speed
-    // Apply a 90 degree fix on X to stand it up
-    const fix_rotation = Mat4.fromRotation(-90.0, Vec3.right());
-
-    // Increased rotation speed to 30.0 for a more lively view
-    const angle = time * 30.0;
-    const spin = Mat4.fromRotation(angle, Vec3.up());
-
-    // Combine: Spin it while it's standing up
-    const model = spin.mul(fix_rotation);
-
-    return projection.mul(view).mul(model);
 }
